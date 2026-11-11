@@ -96,6 +96,11 @@ scripts/      dewarp.py  make_synth.py  evaluate.py  train.py
 已用 Doc3D 第 8 分片完成 **30 轮几何预训练**，并建立两个验证集上的传统几何基线；配置和结果见第 9 节。
 谱种、版面与结构头尚未正式训练，也尚未完成五线谱微调及真实手机照片评测。
 
+可选结构改进（默认关闭，旧权重与旧命令不受影响，见第 10 节）：
+`--coord-input` 在输入端拼接归一化 (x, y) 坐标通道（CoordConv）；
+`--context attn` 在 stride-16 瓶颈处加入 2 层带 2D 位置编码的自注意力（门控残差，门初始化为 0）。
+两者在初始化时均为恒等映射，可直接用旧权重（如 Doc3D 预训练）初始化；网络结构写入 checkpoint 的 `arch` 字段，推理时自动重建。
+
 ## 6. 评测（合成基准，每类 10 页，共 30 页）
 
 真值来自合成器：把每个元素的平面坐标经仿真形变映射到照片上，再经待测方法的正向映射映射到输出图，在输出图里测量。指标都用输出图自身的线距或字高归一化，与输出分辨率无关；`ad_pct` 是做最优相似变换对齐后的残差，以页宽的百分比表示。
@@ -325,3 +330,46 @@ Doc3D 仅训练共享网络、坐标场和页面掩码，谱种、版面和结�
   --checkpoint outputs/doc3d_pretrain/best.pt --out outputs/doc3d_pretrain/preview_deepscores_val.jpg
 .venv/bin/python scripts/report_pretrain.py
 ```
+
+## 10. DeepScores 从零训练的坐标塌缩与网络改进
+
+在准备“Doc3D 预训练 vs 从零训练”对照实验（`scripts/run_finetune_ablation.sh`）时发现：
+原网络在 DeepScores 上以 384×512 **从零训练会塌缩**——所有像素都输出约 0.5 的常数坐标，
+验证 EPE 38.2%，恰好等于“全部预测 0.5”的常数基线 38.3%，19 轮无进展。
+原因：U-Net 感受野约 200 px，在 512 高的输入上看不到页边；而乐谱页大部分是白纸，
+竖直方向上谱表重复出现，局部外观无法区分自己在哪一个谱表。
+这样的对照只能说明“从零训练跑不起来”，无法衡量预训练的收益。
+
+诊断（`outputs/deepscores_finetune/diag/`，pilot 128 张训练、64 张验证，seed 7，单次运行）：
+
+| 设置（从零训练，lr 1e-3） | 分辨率 | 轮数 | 验证 EPE % | U / V 与真值相关系数 |
+|---|---|---:|---:|---|
+| 原网络 | 384×512 | 19（中断） | 38.15，塌缩 | — |
+| 原网络 | 192×256 | 30 | **3.93** | — |
+| + 自注意力 | 384×512 | 20 | 25.40 | 0.99 / **0.37**（V 仍塌缩） |
+| + CoordConv | 384×512 | 20 | 8.74 | 0.98 / 0.99 |
+| + CoordConv + 自注意力 | 384×512 | 20 | **7.27** | 0.99 / 0.99 |
+
+| 设置（Doc3D 初始化，lr 1e-4） | 分辨率 | 轮数 | 初始 → 验证 EPE % |
+|---|---|---:|---|
+| 原网络 | 384×512 | 5 | 18.75 → 9.71 |
+| + 自注意力 | 384×512 | 5 | 18.75 → 9.59 |
+| + CoordConv + 自注意力 | 384×512 | 5 | 18.75 → 9.10 |
+
+结论：
+- 自注意力单独只解决了水平坐标 U，竖直坐标 V 依然塌缩；**CoordConv 是解决 V 塌缩的关键**，二者结合最好。
+- 新模块初始化为恒等映射：从 Doc3D 权重初始化时初始 EPE 与原网络完全相同（18.75%）。
+- 192×256 的原网络从零训练也能收敛，但分辨率减半会损失细节，后续正式实验建议用 384×512 + `--coord-input --context attn`。
+- 以上为单 seed、短训练的诊断，各行轮数和学习率不完全相同，不能作为“预训练 vs 从零训练”的结论。
+
+```bash
+# 推荐的对照实验写法（每组相同数据、步数、分辨率和网络结构）
+COORD=1 CONTEXT=attn scripts/run_finetune_ablation.sh scratch_ca_lr1e-3_s7 data/prepared/deepscores_pilot/train 60 1e-3 7
+COORD=1 CONTEXT=attn scripts/run_finetune_ablation.sh ft_ca_lr1e-4_s7 data/prepared/deepscores_pilot/train 60 1e-4 7 \
+  outputs/doc3d_pretrain/best.pt
+```
+
+全量 DeepScores 数据已重新生成到 `data/prepared/deepscores_full_v3/`（`--limit 0 --variants 2 --seed 7`）：
+train/val/test = **2,810/172/137**，363 个曲谱分组，无跨集合重叠，坐标全部有效，约 5.3 GiB。
+它与 `deepscores_pilot` 使用相同的分组哈希，pilot 的 train/val/test 分组分别只落在 full 的对应集合中，可混用而不泄漏。
+此前中断的半成品 `deepscores_full_v2` 已删除。

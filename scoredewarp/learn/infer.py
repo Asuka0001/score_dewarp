@@ -7,14 +7,14 @@ import torch
 from scipy.interpolate import LinearNDInterpolator
 
 from ..core.transforms import BackwardMap
-from .model import ScoreDewarpNet
+from .model import build_model
 
 KIND_NAMES = ["staff", "jianpu", "mixed"]
 
 
 def load(ckpt, device="cpu"):
-    net = ScoreDewarpNet()
     sd = torch.load(ckpt, map_location=device)
+    net = build_model(sd)
     net.load_state_dict(sd["model"])
     net.eval().to(device)
     return net, sd.get("size", (384, 512))

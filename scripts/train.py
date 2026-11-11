@@ -13,7 +13,7 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scoredewarp.learn.dataset import SynthScoreDataset
-from scoredewarp.learn.model import ScoreDewarpNet, losses
+from scoredewarp.learn.model import ScoreDewarpNet, load_init_weights, losses
 
 
 def geometry_batch(batch):
@@ -90,6 +90,10 @@ def main():
     ap.add_argument("--out", default="outputs/ckpt.pt", help="best validation model; last is saved as *.last.pt")
     ap.add_argument("--init", help="initialize weights for fine-tuning")
     ap.add_argument("--geometry-only", action="store_true")
+    ap.add_argument("--context", choices=["none", "attn"], default="none",
+                    help="global self-attention at the bottleneck (needed for large inputs, see model.py)")
+    ap.add_argument("--context-layers", type=int, default=2)
+    ap.add_argument("--coord-input", action="store_true", help="append normalised (x, y) input channels (CoordConv)")
     ap.add_argument("--patience", type=int, default=8)
     ap.add_argument("--min-delta", type=float, default=.02, help="minimum improvement in UV EPE percentage points")
     ap.add_argument("--seed", type=int, default=7)
@@ -119,15 +123,21 @@ def main():
         if not len(vs):
             ap.error("Validation dataset is empty")
         vl = DataLoader(vs, batch_size=args.bs, num_workers=0)
-    net = ScoreDewarpNet().to(dev)
+    net = ScoreDewarpNet(context=args.context, context_layers=args.context_layers,
+                         coord_input=args.coord_input).to(dev)
+    init_missing = []
     if args.init:
-        net.load_state_dict(torch.load(args.init, map_location=dev, weights_only=True)["model"])
+        init_missing = load_init_weights(net, torch.load(args.init, map_location=dev, weights_only=True)["model"])
+        if init_missing:
+            print(f"init: {len(init_missing)} new context tensors not in {args.init}; started as identity", flush=True)
     if args.geometry_only:
         for head in (net.head_seg, net.head_struct, net.head_kind):
             head.requires_grad_(False)
     opt = torch.optim.AdamW((p for p in net.parameters() if p.requires_grad), lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, args.epochs * len(dl)))
     config = {**vars(args), "device_used": dev, "train_samples": len(ds), "val_samples": len(vs) if vl else 0,
+              "arch": net.arch, "parameters": sum(p.numel() for p in net.parameters()),
+              "init_missing_tensors": len(init_missing),
               "selection_metric": "validation mean per-page UV EPE (%) on all GT page pixels",
               "torch_version": str(torch.__version__)}
     out_path.with_suffix(".config.json").write_text(json.dumps(config, indent=2))
@@ -173,7 +183,7 @@ def main():
         wait = 0 if significant else wait + 1
         if improved:
             best, best_epoch = score, ep
-        checkpoint = {"model": net.state_dict(), "size": tuple(args.size), "epoch": ep, "step": step,
+        checkpoint = {"model": net.state_dict(), "arch": net.arch, "size": tuple(args.size), "epoch": ep, "step": step,
                       "metrics": metrics, "config": config, "best_epoch": best_epoch, "best_score": best,
                       "optimizer": opt.state_dict(), "scheduler": sched.state_dict(), "rng_state": torch.get_rng_state()}
         torch.save(checkpoint, out_path.with_suffix(".last.pt"))
