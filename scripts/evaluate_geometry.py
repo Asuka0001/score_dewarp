@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from scoredewarp.core.pipeline import Config, dewarp
+from scoredewarp.core.pipeline import Config, dewarp, refine_dewarp
 from scoredewarp.eval.geometry import geometry_metrics, sample_geometry, network_points, orientation_error_rate
 
 
@@ -52,13 +52,60 @@ def summarize(rows):
         record = {"samples": len(group), "failed": sum(r["status"] != "ok" for r in group),
                   "undefined_ad": sum(r.get("ad_pct") is None for r in group)}
         metrics = ["coverage", "ad_pct", "local_distortion_pct", "time_s"]
-        metrics += [k for k in ("coord_epe_pct_all_gt", "orientation_error_rate") if any(k in r for r in group)]
+        metrics += [k for k in ("coord_epe_pct_all_gt", "orientation_error_rate", "common_ad_pct",
+                               "common_local_distortion_pct", "common_coverage") if any(k in r for r in group)]
         for metric in metrics:
             values = [r[metric] for r in group if r.get(metric) is not None and np.isfinite(r[metric])]
             record[metric + "_mean"] = float(np.mean(values)) if values else None
             record[metric + "_median"] = float(np.median(values)) if values else None
         summary[name] = record
     return summary
+
+
+def hybrid_rows(image, meta, points, target, valid, page, out, width):
+    """Measure the actual invertible output maps, including inversion losses.
+
+    The neural page mask still limits coverage, so scattered inversion cannot
+    silently fill missing predicted page regions in the evaluation.
+    """
+    from scoredewarp.learn.infer import backward_map
+    rows = []
+    predictions = []
+    initial = None
+    for name in ("network_bmap", "network+C"):
+        start = time.perf_counter()
+        row = {"sample": meta["sample"], "kind": meta["kind"], "method": name}
+        try:
+            if initial is None:
+                # Fixed output aspect; no per-sample GT geometry initializes the model.
+                initial = backward_map(out, (image.shape[1], image.shape[0]), (width, round(width * 1754 / 1240)))
+            bm = initial
+            if name == "network+C":
+                result = refine_dewarp(image, initial)
+                bm = result.bmap
+                row["structures"] = result.structures.summary()
+            pred = bm.forward_points(points.reshape(-1, 2)).reshape(points.shape)
+            pred_valid = (page & (pred >= 0).all(-1) & (pred[..., 0] < bm.out_size[0]) &
+                          (pred[..., 1] < bm.out_size[1]))
+            # Reject points for which scattered inversion bridges a hole/fold:
+            # the returned output point must sample the original photo point.
+            roundtrip = bm.sample(pred.reshape(-1, 2)).reshape(points.shape)
+            pred_valid &= np.linalg.norm(roundtrip - points, axis=-1) <= 2.
+            row.update(geometry_metrics(target, pred, valid, pred_valid), status="ok")
+            row["orientation_error_rate"] = orientation_error_rate(target, pred, valid & pred_valid)
+            predictions.append((row, pred, pred_valid))
+        except Exception as exc:
+            row.update(status="failed", error=f"{type(exc).__name__}: {exc}", coverage=0.,
+                       ad_pct=None, local_distortion_pct=None)
+        row["time_s"] = time.perf_counter() - start
+        rows.append(row)
+    if len(predictions) == 2:
+        common = predictions[0][2] & predictions[1][2]
+        for row, pred, _ in predictions:
+            metrics = geometry_metrics(target, pred, valid, common)
+            for key in ("coverage", "ad_pct", "local_distortion_pct"):
+                row["common_" + key] = metrics[key]
+    return rows
 
 
 def main():
@@ -71,7 +118,10 @@ def main():
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--retry-failed", action="store_true", help="with --resume, retry failed samples and archive their previous rows")
     ap.add_argument("--checkpoint", type=Path, help="evaluate learned field instead of classical baselines")
+    ap.add_argument("--hybrid", action="store_true", help="with --checkpoint, also evaluate inverted network map and network+C")
     args = ap.parse_args()
+    if args.hybrid and not args.checkpoint:
+        ap.error("--hybrid requires --checkpoint")
     samples = sorted(p for p in args.data.iterdir() if (p / "gt.json").exists())
     if args.limit:
         samples = samples[:args.limit]
@@ -84,6 +134,10 @@ def main():
     if args.checkpoint:
         with args.checkpoint.open("rb") as f:
             config["checkpoint_sha256"] = hashlib.file_digest(f, "sha256").hexdigest()
+    if args.hybrid:
+        config["hybrid"] = {"version": 2, "field_iters": 2, "field_node": 48,
+                            "output_size": [args.coarse_width, round(args.coarse_width * 1754 / 1240)],
+                            "roundtrip_tolerance_px": 2.}
     config_path = args.out / "config.json"
     if config_path.exists():
         if not args.resume or json.loads(config_path.read_text()) != config:
@@ -118,7 +172,11 @@ def main():
                    **geometry_metrics(target, pred, valid, page), "time_s": time.perf_counter() - start}
             row["coord_epe_pct_all_gt"] = float(np.linalg.norm((pred - target)[valid], axis=-1).mean() * 100)
             row["orientation_error_rate"] = orientation_error_rate(target, pred, valid)
-            (row_dir / (folder.name + ".json")).write_text(json.dumps([row], indent=2))
+            rows = [row]
+            if args.hybrid:
+                rows += hybrid_rows(image, {**meta, "sample": folder.name}, points, target, valid, page,
+                                    out, args.coarse_width)
+            (row_dir / (folder.name + ".json")).write_text(json.dumps(rows, indent=2))
             if (i + 1) % 10 == 0:
                 print(f"network {i+1}/{len(pending)}", flush=True)
     else:

@@ -124,6 +124,25 @@ def dewarp(img: np.ndarray, cfg: Config | None = None, verbose=False) -> Result:
         stages["structures_coarse"] = S1.summary()
         T["surface"] = time.time() - t
 
+    return _finish(img, cur, bm, cfg, stages, T, t0, verbose)
+
+
+def refine_dewarp(img: np.ndarray, initial_map: BackwardMap, cfg: Config | None = None,
+                  verbose=False) -> Result:
+    """Refine an existing learned rectification with stage C, then detect output.
+
+    A/B are skipped: the nonlinear learned map cannot initialize B's homography
+    interface. All residual maps compose back to the original photo, so each
+    candidate output is sampled directly from the original pixels.
+    """
+    cfg = cfg or Config()
+    t0 = time.time()
+    cur = initial_map.apply(img, value=255)
+    return _finish(img, cur, initial_map, cfg, {"initialization": "network", "surface_skipped": True},
+                   {}, t0, verbose)
+
+
+def _finish(img, cur, bm, cfg, stages, T, t0, verbose):
     # ---- C: residual field ---------------------------------------------------
     if cfg.use_field:
         t = time.time()

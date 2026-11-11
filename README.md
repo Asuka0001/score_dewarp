@@ -94,7 +94,7 @@ scripts/      dewarp.py  make_synth.py  evaluate.py  train.py
 
 当前状态：数据集、模型、损失、训练（MPS/CUDA/CPU）、推理都已打通。
 已用 Doc3D 第 8 分片完成 **30 轮几何预训练**，并建立两个验证集上的传统几何基线；配置和结果见第 9 节。
-谱种、版面与结构头尚未正式训练，也尚未完成五线谱微调及真实手机照片评测。
+谱种、版面与结构头尚未正式训练。五线谱小规模微调及预训练对照已完成（见第 10 节）；真实手机照片尚未评测。
 
 可选结构改进（默认关闭，旧权重与旧命令不受影响，见第 10 节）：
 `--coord-input` 在输入端拼接归一化 (x, y) 坐标通道（CoordConv）；
@@ -320,7 +320,7 @@ Doc3D 仅训练共享网络、坐标场和页面掩码，谱种、版面和结�
 可查看[Doc3D 模型预览](outputs/doc3d_pretrain/preview_doc3d_val.jpg)和[五线谱模型预览](outputs/doc3d_pretrain/preview_deepscores_val.jpg)。
 当前权重用于后续微调初始化；实际乐谱校正先沿用传统方案。
 预训练对乐谱微调的收益，需要下一步与从零训练的 DeepScores 模型做对照，不能由本轮同域结果直接推断。
-本轮只评测验证集，尚未使用测试集，也尚未进行正式的五线谱微调或真实手机照片评测。
+本节这轮预训练实验只评测验证集，未使用测试集；后续五线谱微调及所选模型的测试集结果见第 10 节。真实手机照片仍未评测。
 
 ```bash
 # 生成定性预览和汇总报告。
@@ -404,3 +404,53 @@ train/val/test = **2,810/172/137**，363 个曲谱分组，无跨集合重叠，
   因此网络更适合作为 B/C 优化的初值或兜底，而非直接替代（与第 7 节“学习给初值，优化保精度”的规划一致）。
 - 局限：单 seed、仅 128 张训练页、仅合成形变；预训练组的最佳轮次接近第 60 轮，可能尚未收敛。
   下一步：多 seed 复现、在 `deepscores_full_v3`（2,810 张）上训练、把网络输出接入 B/C 精修。
+
+## 11. 第二阶段：多 seed、全量训练与网络+C
+
+2026-11-11 已启动本机 MPS 训练队列（尚未完成）。`scripts/run_next_stage.py` 顺序运行：
+
+1. pilot 的 seed=17、27，各做从零训练 / Doc3D 初始化两组，统一 LR=1e-3、60 轮、384×512、CoordConv + attention。与已有 seed=7 的同 LR 结果组成三 seed 对照。
+2. Doc3D 初始化的全量训练：train=2,810、val=172，seed=7、LR=1e-3、最多 60 轮，patience=12。按验证 UV EPE 选模。
+3. 在全量验证集上比较原始网络坐标、反演后的实际映射、网络+C 局部精修。另已用现有 seed=7 pilot 最佳微调权重完成 64 页混合验证，结果见下方。
+
+此轮不新增 test 评测。队列状态在 `outputs/next_stage/status.json`，各任务日志在同目录；当前 epoch 查看对应训练目录的 `best.history.json`。
+多 seed 报告将在四组训练及验证完成后写入 `reports/deepscores_multiseed.md`。
+全量权重目录为 `outputs/deepscores_finetune/full_ca_lr1e-3_s7/`；其验证结果与混合结果分别在 `eval_val/` 和 `outputs/hybrid/full_val/`。
+不同验证集的结果不能直接比较训练数据规模的收益；后续应把全量模型也评测在原来的 64 页 pilot val 上，再与第 10 节对照。
+
+混合版本先使用 **网络 → C**，跳过 A/B：B 当前接收单应初值，尚未支持非线性网络场初始化。
+`refine_dewarp` 把 C 的残差映射组合回原照片，避免对中间图像重复重采样；最终谱种仍由结构检测器产生，不采用未训练的 kind 头。
+不保证 C 一定改善结果，需结合局部畸变和覆盖率检查。
+
+```bash
+# 新启动队列；已经有队列运行时不要重复启动。
+.venv/bin/python scripts/run_next_stage.py --device mps
+
+# 使用现有权重校正并做 C 精修；加 --network-only 可只看网络结果。
+.venv/bin/python scripts/dewarp.py my_score.jpg \
+  --checkpoint outputs/deepscores_finetune/ft_ca_lr1e-3_s7/best.pt --out outputs/hybrid/run
+
+# 混合流程评测与报告（完成后可使用 --resume 复用相同配置的结果）。
+.venv/bin/python scripts/evaluate_geometry.py --data data/prepared/deepscores_pilot/val \
+  --checkpoint outputs/deepscores_finetune/ft_ca_lr1e-3_s7/best.pt \
+  --hybrid --out outputs/hybrid/pilot_val --resume
+.venv/bin/python scripts/report_hybrid.py --eval outputs/hybrid/pilot_val --out reports/hybrid_pilot.md
+```
+
+混合评测使用预测页面掩码，并检查输出画布边界及 2 px 原图往返误差，避免映射反演跨越空洞时虚增覆盖率。
+`summary.json` 额外记录 network_bmap / network+C 在每页共同有效点上的 `common_ad_pct`、`common_local_distortion_pct` 和 `common_coverage`，
+用于区分真实精修收益与有效点减少造成的误差下降。四页冒烟结果仅用于确认流程可运行，不作为效果结论。
+
+### 首轮网络+C 验证结果（pilot val，64 页）
+
+完整结果见 [reports/hybrid_pilot.md](reports/hybrid_pilot.md)。本轮 64 页均完成，无异常失败；19 项单元测试通过。
+
+| 方法 | AD % 中位数 | 局部畸变 % 中位数 | 平均覆盖率 |
+|---|---:|---:|---:|
+| 原始网络坐标 | 2.004 | 13.303 | 99.75% |
+| 网络反演映射 | 1.998 | 13.150 | 98.96% |
+| 网络+C | 1.874 | 12.843 | 98.13% |
+
+在 C 前后每页共同有效的点上，43/64 页的 AD 改善，60/64 页的局部畸变改善；
+逐页差值中位数分别为 −0.016 和 −0.061 个百分点。改善幅度较小，仍未达到传统 A+B 的局部畸变水平。
+C 后没有页面的覆盖率下降超过 5 个百分点，但整体平均覆盖率有所降低，后续需处理边界缺失和检测不稳定。
