@@ -1,0 +1,6 @@
+numpy>=1.26
+scipy>=1.11
+opencv-python-headless>=4.9
+pillow>=10.0
+torch>=2.2        # only needed for scoredewarp/learn
+matplotlib>=3.8   # optional, plotting
