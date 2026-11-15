@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scoredewarp.core.pipeline import Config, dewarp, refine_dewarp, result_json
 from scoredewarp.core.structures import draw_structures
 from scoredewarp.eval.geometry import (sample_geometry, geometry_metrics, map_points,
-                                       network_points, paired_geometry_metrics)
+                                       network_points, paired_geometry_metrics, orientation_error_rate)
 from scoredewarp.eval.metrics import evaluate
 from scoredewarp.eval.structures import staff_detection_metrics
 from scoredewarp.learn.infer import load, predict
@@ -31,15 +31,17 @@ STRUCTURE_KEYS = ("coverage", "staff_straight", "staff_spacing_cv", "barline_til
                   "jp_height_cv", "jp_tilt_deg", "jp_dot_err", "jp_lyric_err", "jp_rowgap_cv")
 
 
-def measure(folder, net, size, width, save_dir=None):
+def measure(folder, net, size, width, save_dir=None, *, networks=None):
     image, meta, points, target, valid = sample_geometry(folder)
     gt = json.loads((folder / "gt.json").read_text())
-    rows, maps, predictions, raw = [], {}, {}, None
-    for name in ("input", "traditional", "network_only"):
-        row = {"sample": folder.name, "kind": meta["kind"], "method": name}
+    networks = networks if networks is not None else {"network_only": (net, size)}
+    rows, maps, predictions = [], {}, {}
+    for name in ("input", "traditional", *networks):
+        row = {"sample": folder.name, "kind": meta["kind"], "method": name,
+               "profile": meta.get("profile", "unspecified")}
         start = time.perf_counter()
         try:
-            result = None
+            result, raw = None, None
             if name == "input":
                 pred, keep = points, np.isfinite(points).all(-1)
                 mapper = lambda p: np.asarray(p, float).copy()
@@ -48,12 +50,13 @@ def measure(folder, net, size, width, save_dir=None):
                 if name == "traditional":
                     result = dewarp(image, Config(coarse_width=width))
                 else:
-                    bm, _, raw = predict(net, image, size, out_size=(width, round(width * 2263 / 1600)))
+                    model, model_size = networks[name]
+                    bm, _, raw = predict(model, image, model_size, out_size=(width, round(width * 2263 / 1600)))
                     result = refine_dewarp(image, bm, Config(use_field=False))
                 row["time_s"] = time.perf_counter() - start
                 bm = result.bmap
                 # Capture bmap/raw in defaults: maps remain valid after this loop.
-                def validity(p, bm=bm, raw=raw if name == "network_only" else None):
+                def validity(p, bm=bm, raw=raw):
                     page = None
                     if raw is not None:
                         _, page = network_points(raw, p, (image.shape[1], image.shape[0]),
@@ -68,6 +71,7 @@ def measure(folder, net, size, width, save_dir=None):
             # and file export, matching the CLI's image-production timing.
             row.setdefault("time_s", time.perf_counter() - start)
             row.update(geometry_metrics(target, pred, valid, keep), status="ok")
+            row["orientation_error_rate"] = orientation_error_rate(target, pred, valid & keep)
             music = evaluate(gt, mapper, point_valid=validity)
             row["music"] = music
             if result is not None:
@@ -85,16 +89,29 @@ def measure(folder, net, size, width, save_dir=None):
         rows.append(row)
     # Only compare the two actual correction methods. The original photo is
     # reported separately, so it cannot change their common support.
-    names = ("traditional", "network_only")
+    names = ("traditional", *networks)
     if all(name in maps for name in names):
         paired = paired_geometry_metrics(target, {name: predictions[name] for name in names}, valid)
         def common_valid(p):
-            return maps[names[0]][1](p) & maps[names[1]][1](p)
+            return np.logical_and.reduce([maps[name][1](p) for name in names])
         for row in rows:
             name = row["method"]
             if name in paired:
                 row["common_geometry"] = paired[name]
                 row["common_music"] = evaluate(gt, maps[name][0], point_valid=common_valid)
+        # Preserve pairwise support as well: a third method with low coverage
+        # must not hide errors when comparing the two training ablations.
+        for i, left in enumerate(names):
+            for right in names[i + 1:]:
+                pair = paired_geometry_metrics(target, {n: predictions[n] for n in (left, right)}, valid)
+                def pair_valid(p, left=left, right=right):
+                    return maps[left][1](p) & maps[right][1](p)
+                for row in rows:
+                    name = row["method"]
+                    if name in pair:
+                        row.setdefault("paired", {})[right if name == left else left] = {
+                            "geometry": pair[name],
+                            "music": evaluate(gt, maps[name][0], point_valid=pair_valid)}
     return rows
 
 
@@ -106,12 +123,14 @@ def median(rows, key, section=None):
 
 def report(rows, out):
     lines = ["# 素材评测：几何、共同有效点、乐谱结构与检测质量", "",
-             "traditional = A+B+C；network_only = 网络反演后的实际输出映射，不加 C。",
-             "两种方法均检查画布边界与 2px 往返误差；common 列使用两者有效点交集。",
+             "traditional = A+B+C；其余校正方法为网络反演后的实际输出映射，不加 C。",
+             "校正方法均检查画布边界与 2px 往返误差；common 列使用所有校正方法的有效点交集。",
              "结构误差由真值关键点计算，非检测器自评分；DeepScores 无结构真值，相关项留空。",
              "误差与覆盖率列取逐页中位数；谱种正确率取均值。谱表检测按实例一对一匹配汇总。",
              "未定义指标显示 —，不计为零。coverage 为采样网格覆盖率，music 内另有结构关键点覆盖率。", ""]
     summary = []
+    methods = list(dict.fromkeys(r["method"] for r in rows))
+    corrected = [m for m in methods if m != "input"]
     def fmt(v, mult=1):
         return "—" if v is None else f"{v * mult:.3f}"
     for dataset, kind in sorted({(r['dataset'], r['kind']) for r in rows}):
@@ -119,7 +138,7 @@ def report(rows, out):
                   "| 方法 | 页数/失败 | AD% | 局部畸变% | 覆盖率% | common AD% | common 局部畸变% | common 覆盖率% | 谱种正确率% |",
                   "|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
         groups = {}
-        for method in ("input", "traditional", "network_only"):
+        for method in methods:
             group = [r for r in rows if (r['dataset'], r['kind'], r['method']) == (dataset, kind, method)]
             groups[method] = group
             entry = {"dataset": dataset, "kind": kind, "method": method, "samples": len(group),
@@ -148,7 +167,7 @@ def report(rows, out):
                     lines.append('| ' + method + (' / common' if section == 'common_music' else ' / own') + ' | ' +
                                  ' | '.join(fmt(median(group, key, section)) for key in keys) + ' |')
             lines += ['', '| 方法 | 匹配/预测/真值谱表数 | 谱表 precision | 谱表 recall |', '|---|---:|---:|---:|']
-            for method in ('traditional', 'network_only'):
+            for method in corrected:
                 g = groups[method]
                 counts = [sum(r.get('detection', {}).get(key, 0) for r in g)
                           for key in ('staff_matched', 'staff_pred_count', 'staff_gt_count')]
@@ -162,7 +181,7 @@ def report(rows, out):
         lines.append(f"- {r['dataset']}/{r['sample']} / {r['method']}: {r['error']}")
     if not failures:
         lines.append('无运行异常。以下列出各方法 AD 最高的 5 页，低覆盖率也需单独检查：')
-    for method in ('traditional', 'network_only'):
+    for method in corrected:
         worst = sorted([r for r in rows if r['method'] == method and r.get('ad_pct') is not None], key=lambda r: r['ad_pct'], reverse=True)[:5]
         for r in worst:
             lines.append(f"- {method}: {r['dataset']}/{r['sample']}, AD={r['ad_pct']:.3f}%, coverage={r['coverage']:.1%}")
@@ -186,7 +205,8 @@ def report(rows, out):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--data', type=Path, action='append', required=True)
-    ap.add_argument('--checkpoint', type=Path, required=True)
+    ap.add_argument('--checkpoint', type=Path, action='append', required=True,
+                    help='repeat to compare models; multi-model names use checkpoint parent directory names')
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--limit', type=int, default=0, help='per dataset, sorted by sample name')
     ap.add_argument('--save-images', action='store_true')
@@ -196,10 +216,14 @@ def main():
         ap.error('Use a new empty output directory')
     args.out.mkdir(parents=True, exist_ok=True)
     cv2.setNumThreads(1)
-    net, size = load(args.checkpoint)
+    names = ['network_only'] if len(args.checkpoint) == 1 else [p.parent.name for p in args.checkpoint]
+    if len(set(names)) != len(names) or set(names) & {'input', 'traditional'}:
+        ap.error('Checkpoint parent directory names must be distinct and not input/traditional')
+    networks = {name: load(path) for name, path in zip(names, args.checkpoint)}
     config = {key: str(value) if isinstance(value, Path) else value for key,value in vars(args).items()}
     config['data'] = [str(p.resolve()) for p in args.data]
-    config['checkpoint_sha256'] = hashlib.sha256(args.checkpoint.read_bytes()).hexdigest()
+    config['checkpoint'] = {name: {'path': str(path.resolve()), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+                            for name, path in zip(names, args.checkpoint)}
     # Include code diff because checks are often run before committing a fix.
     config['git_head'] = subprocess.run(['git','rev-parse','HEAD'],capture_output=True,text=True).stdout.strip()
     diff = subprocess.run(['git','diff'],capture_output=True,text=True).stdout
@@ -215,13 +239,17 @@ def main():
         label = str(dataset)
         for i, folder in enumerate(folders):
             dest = args.out / dataset.parent.name / dataset.name / folder.name if args.save_images else None
-            sample_rows = measure(folder, net, size, args.width, dest)
+            sample_rows = measure(folder, None, None, args.width, dest, networks=networks)
             for row in sample_rows:
                 row['dataset'] = label
             rows.extend(sample_rows)
             (args.out / 'per_sample.json').write_text(json.dumps(rows, indent=2))
             print(f'{label}: {i+1}/{len(folders)} {folder.name}', flush=True)
     report(rows, args.out)
+    for profile in sorted({r['profile'] for r in rows} - {'unspecified'}):
+        dest = args.out / 'profiles' / profile
+        dest.mkdir(parents=True)
+        report([r for r in rows if r['profile'] == profile], dest)
     print(args.out / 'report.md', flush=True)
     if any(r['status'] != 'ok' for r in rows):
         raise SystemExit('Some method runs failed; see per_sample.json')

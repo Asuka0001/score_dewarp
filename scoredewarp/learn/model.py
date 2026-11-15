@@ -158,13 +158,16 @@ def _instance_variance(val, inst):
         s1 = torch.zeros(n, device=v.device).index_add_(0, ids, v)
         s2 = torch.zeros(n, device=v.device).index_add_(0, ids, v * v)
         ok = cnt > 3
+        if not ok.any():
+            continue
         var = s2[ok] / cnt[ok] - (s1[ok] / cnt[ok]) ** 2
         losses.append(var.clamp_min(0).mean())
     return torch.stack(losses).mean() if losses else val.sum() * 0
 
 
 def losses(out, batch, w=None):
-    w = w or {"fwd": 1.0, "grad": 0.5, "page": 0.2, "seg": 0.2, "struct": 0.2, "kind": 0.1, "cons": 50.0}
+    w = {"fwd": 1.0, "grad": 0.5, "page": 0.2, "seg": 0.2, "struct": 0.2, "kind": 0.1,
+         "cons": 50.0, **(w or {})}
     page = batch["page"]
     pf, gf = out["fwd"], batch["fwd"]
     L = {}

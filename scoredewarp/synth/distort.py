@@ -103,6 +103,25 @@ class PageWarp:
         return np.abs(n @ light)
 
 
+def projection_diagnostics(warp):
+    """Sample signed projected cell areas to reject folds/near-tangent pages.
+
+    This is a generation-time geometry check, independent of any model. It
+    does not replace a visibility renderer or prove continuous invertibility.
+    """
+    y, x = np.mgrid[0:warp.Hf:129j, 0:warp.Wf:97j]
+    p = warp.forward(np.stack([x, y], -1)).reshape(129, 97, 2)
+    # Both triangles in every cell must preserve orientation.
+    cross = lambda a, b: a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+    areas = np.stack([cross(p[:-1, 1:] - p[:-1, :-1], p[1:, :-1] - p[:-1, :-1]),
+                      cross(p[1:, 1:] - p[1:, :-1], p[1:, 1:] - p[:-1, 1:])])
+    finite = np.isfinite(areas).all()
+    typical = float(np.median(areas)) if finite else 0.
+    ratio = float(areas.min() / typical) if finite and typical > 0 else -1.
+    return {"grid": [97, 129], "min_signed_area_ratio": ratio,
+            "valid": bool(finite and ratio > .02)}
+
+
 def _background(rng, H, W):
     base = np.array(rng.choice([[60, 45, 35], [120, 95, 70], [40, 40, 45], [150, 150, 150], [90, 70, 60],
                                 [200, 190, 175]]), float)
@@ -117,10 +136,21 @@ def _background(rng, H, W):
 
 
 def simulate_photo(flat: np.ndarray, ann: list[dict], rng: np.random.Generator, out_wh=(1200, 1600),
-                   strength=1.0, degrade=True):
+                   strength=1.0, degrade=True, *, shadow_probability=0.6, blur_sigma=None,
+                   require_invertible=False):
     Hf, Wf = flat.shape[:2]
     W, H = out_wh
     pw = PageWarp((Wf, Hf), out_wh, rng, strength)
+    projection = None
+    if require_invertible:
+        for attempt in range(64):
+            projection = projection_diagnostics(pw)
+            if projection["valid"]:
+                projection["rejected_candidates"] = attempt
+                break
+            pw = PageWarp((Wf, Hf), out_wh, rng, strength)
+        else:
+            raise ValueError("Cannot generate a nonfolding projection after 64 attempts")
 
     # dense flat grid -> photo; invert with Delaunay linear interpolation
     st = 5
@@ -167,7 +197,7 @@ def simulate_photo(flat: np.ndarray, ann: list[dict], rng: np.random.Generator, 
         vig = 1 - rng.uniform(0, 0.5) * r2
         out *= (grad * vig)[..., None]
         # cast shadow (e.g. phone / hand)
-        if rng.random() < 0.6:
+        if rng.random() < shadow_probability:
             sm = np.zeros((H, W), np.float32)
             cx, cy = rng.uniform(0, W), rng.uniform(0, H)
             pts = np.stack([cx + rng.normal(0, W * 0.35, 6), cy + rng.normal(0, H * 0.35, 6)], 1)
@@ -195,7 +225,7 @@ def simulate_photo(flat: np.ndarray, ann: list[dict], rng: np.random.Generator, 
             skin = np.array([rng.uniform(170, 230), rng.uniform(120, 170), rng.uniform(90, 140)])
             out = out * (1 - fm[..., None]) + skin[None, None] * fm[..., None] * (0.8 + 0.2 * fm[..., None])
             occl = fm
-        sigma = rng.uniform(0.0, 1.1)
+        sigma = rng.uniform(0.0, 1.1) if blur_sigma is None else blur_sigma
         if sigma > 0.3:
             out = cv2.GaussianBlur(out, (0, 0), sigma)
         out = out + rng.normal(0, rng.uniform(1.5, 5), out.shape)
@@ -218,4 +248,5 @@ def simulate_photo(flat: np.ndarray, ann: list[dict], rng: np.random.Generator, 
         "occlusion": (occl > 0.5).astype(np.uint8),
         "bmap_lo": bmap_lo,                 # photo(stride 2) -> flat px, NaN off-page
         "warp": pw,
+        "projection": projection,
     }

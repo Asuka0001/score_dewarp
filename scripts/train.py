@@ -16,25 +16,29 @@ from scoredewarp.learn.dataset import SynthScoreDataset
 from scoredewarp.learn.model import ScoreDewarpNet, load_init_weights, losses
 
 
-def geometry_batch(batch):
+def geometry_batch(batch, *, keep_instances=False):
     batch = dict(batch)
     for head in ("seg", "struct", "kind"):
         batch[head + "_valid"] = torch.zeros_like(batch[head + "_valid"])
-    batch["inst_h"] = torch.zeros_like(batch["inst_h"])
-    batch["inst_v"] = torch.zeros_like(batch["inst_v"])
+    for name in ("inst_h", "inst_v"):
+        batch[name] = (batch[name] * (batch["page"][:, 0] > .5) if keep_instances
+                       else torch.zeros_like(batch[name]))
     return batch
 
 
 @torch.no_grad()
-def validate(net, loader, device, geometry_only):
+def validate(net, loader, device, geometry_only, consistency_weight=None):
     net.eval()
     records = []
     for batch in loader:
         batch = {k: v.to(device) for k, v in batch.items()}
+        kinds = batch["kind"]
+        kind_valid = batch.get("kind_valid", torch.ones_like(kinds))
         if geometry_only:
-            batch = geometry_batch(batch)
+            batch = geometry_batch(batch, keep_instances=bool(consistency_weight))
         out = net(batch["image"])
-        loss, parts = losses(out, batch)
+        weights = {"cons": consistency_weight} if consistency_weight is not None else None
+        loss, parts = losses(out, batch, w=weights)
         page = batch["page"][:, 0] > .5
         # All GT page pixels, regardless of the network's page confidence.
         error = torch.linalg.vector_norm(out["fwd"] - batch["fwd"], dim=1)
@@ -44,8 +48,14 @@ def validate(net, loader, device, geometry_only):
         union = (predicted | page).flatten(1).sum(1).clamp_min(1)
         iou = intersection / union
         for j in range(len(epe)):
-            records.append({"coord_epe_pct": epe[j].item(), "page_iou": iou[j].item()})
-    return {k: float(np.mean([r[k] for r in records])) for k in records[0]}
+            records.append({"coord_epe_pct": epe[j].item(), "page_iou": iou[j].item(),
+                            "kind": int(kinds[j]) if kind_valid[j] else -1})
+    metrics = {k: float(np.mean([r[k] for r in records])) for k in ("coord_epe_pct", "page_iou")}
+    for kind, name in enumerate(("staff", "jianpu", "mixed")):
+        group = [r for r in records if r["kind"] == kind]
+        if group:
+            metrics[name + "_coord_epe_pct"] = float(np.mean([r["coord_epe_pct"] for r in group]))
+    return metrics
 
 
 def check_split(train, val):
@@ -90,6 +100,8 @@ def main():
     ap.add_argument("--out", default="outputs/ckpt.pt", help="best validation model; last is saved as *.last.pt")
     ap.add_argument("--init", help="initialize weights for fine-tuning")
     ap.add_argument("--geometry-only", action="store_true")
+    ap.add_argument("--consistency-weight", type=float,
+                    help="override structure consistency weight; with --geometry-only, retain GT instances when positive")
     ap.add_argument("--context", choices=["none", "attn"], default="none",
                     help="global self-attention at the bottleneck (needed for large inputs, see model.py)")
     ap.add_argument("--context-layers", type=int, default=2)
@@ -102,6 +114,8 @@ def main():
     args = ap.parse_args()
     if args.epochs < 1 or args.bs < 1:
         ap.error("epochs and bs must be positive")
+    if args.consistency_weight is not None and (not np.isfinite(args.consistency_weight) or args.consistency_weight < 0):
+        ap.error("consistency-weight must be finite and nonnegative")
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.exists():
@@ -143,19 +157,20 @@ def main():
     out_path.with_suffix(".config.json").write_text(json.dumps(config, indent=2))
     history, best, best_epoch, wait, step = [], float("inf"), 0, 0, 0
     t0 = time.time()
-    initial = validate(net, vl, dev, args.geometry_only) if vl else {}
+    initial = validate(net, vl, dev, args.geometry_only, args.consistency_weight) if vl else {}
     history.append({"epoch": 0, "step": 0, "elapsed_s": time.time()-t0, **{"val_"+k:v for k,v in initial.items()}})
     print("device", dev, "train", len(ds), "val", len(vs) if vl else 0, "initial", initial, flush=True)
     stop_reason = "epochs_completed"
     for ep in range(1, args.epochs + 1):
         net.train()
-        train_sum, count = 0., 0
+        train_sum, count, component_sums = 0., 0, {}
         for batch in dl:
             batch = {k: v.to(dev) for k, v in batch.items()}
             if args.geometry_only:
-                batch = geometry_batch(batch)
+                batch = geometry_batch(batch, keep_instances=bool(args.consistency_weight))
             opt.zero_grad(set_to_none=True)
-            loss, parts = losses(net(batch["image"]), batch)
+            weights = {"cons": args.consistency_weight} if args.consistency_weight is not None else None
+            loss, parts = losses(net(batch["image"]), batch, w=weights)
             if not torch.isfinite(loss):
                 raise ValueError(f"Nonfinite training loss at step {step}")
             loss.backward()
@@ -165,14 +180,17 @@ def main():
             step += 1
             n = batch["image"].shape[0]
             train_sum += loss.item() * n
+            for key, value in parts.items():
+                component_sums[key] = component_sums.get(key, 0.) + value * n
             count += n
             if step % 100 == 0 or step == 1:
                 print(f"epoch {ep} step {step} loss {loss.item():.5f} elapsed {time.time()-t0:.0f}s", flush=True)
             if args.steps and step >= args.steps:
                 stop_reason = "step_limit"
                 break
-        metrics = validate(net, vl, dev, args.geometry_only) if vl else {}
+        metrics = validate(net, vl, dev, args.geometry_only, args.consistency_weight) if vl else {}
         row = {"epoch": ep, "step": step, "train_loss": train_sum / count,
+               "train_parts": {k: v / count for k, v in component_sums.items()},
                "elapsed_s": time.time()-t0, "lr": opt.param_groups[0]["lr"], **{"val_"+k:v for k,v in metrics.items()}}
         history.append(row)
         score = metrics.get("coord_epe_pct", train_sum/count)

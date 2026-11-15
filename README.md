@@ -505,3 +505,41 @@ test 只评测一次，模型和 C 的参数都已按验证集固定。完整表
   --checkpoint outputs/deepscores_finetune/full_ca_lr1e-3_s7/best.pt \
   --out outputs/materials_new --save-images
 ```
+
+## 13. 固定合成基准与简谱/混排训练（2026-11-15）
+
+`prepare_structure_suite.py` 固定生成三种谱种 × 五档条件（轻度、标准、强形变、阴影、模糊），
+train/val/test = **300/90/90**。每页独立 seed、来源分组与 SHA-256；保存字体校验和，
+检查重复平整页与照片，验证坐标范围及跨集合来源隔离。标准档也可能随机含阴影/模糊，各档不是互斥因素。
+最终使用 v2：生成时检查 97×129 网格中每格两个三角形的投影方向，拒绝翻折与近切向形变，
+避免给需要一一对应坐标场的模型提供不可靠真值；检查结果与重采样次数写入 manifest。
+
+`run_structure_ablation.py` 先评测既有全量模型，再运行两组受控微调：
+相同初始化、300 张合成训练页 + 固定 100 张 DeepScores train 回放页、seed=7、24 轮、LR=1e-4。
+`data_only` 只训练几何；`structure_consistency` 额外约束水平/竖直结构实例的坐标方差（权重 50）。
+两组均冻结 seg/struct/kind 头，按新 val 的 UV EPE 选模，训练全部完成后才评测保留 test。
+另在 172 张 DeepScores val 检查原域保持。它验证结构约束对几何头的效果，尚未训练结构检测热图头。
+
+统一评测现支持重复 `--checkpoint`，一次比较多个网络与传统方案；保留全体共同点及逐对共同点结果，
+并按条件输出分层报告。本轮输出宽度统一为 1240，与此前宽度 1600 的检测指标不直接横比。
+
+```bash
+# 要求新的空数据目录；默认产生 480 张素材
+.venv/bin/python scripts/prepare_structure_suite.py --out data/prepared/structure_suite_20261115_v2
+.venv/bin/python scripts/check_external_data.py data/prepared/structure_suite_20261115_v2
+# 一个 GPU 任务依次执行，状态和日志写入 outputs/structure_ablation_20261115_v2/
+.venv/bin/python scripts/run_structure_ablation.py --device mps
+```
+
+训练器新增 `--geometry-only --consistency-weight 50`，保留页内结构实例，同时关闭辅助头监督；
+`--consistency-weight 0` 为相同训练数据下的几何对照。未提供参数时保持原训练行为。
+损失函数支持部分权重覆盖，并跳过采样点不足的实例，避免空均值导致 NaN。
+
+固定基准及原模型结果见 [分层合成基准报告](reports/structure_benchmark_20261115.md)。
+
+两组均完成 24 轮 / 1,200 步，最佳权重都来自第 20 轮：验证 UV EPE 从 1.485% 降到
+data_only **0.6823%**、structure_consistency **0.6799%**。
+保留 test 上，增加数据后简谱/混排 AD 中位数分别从 0.745%/0.866% 降至 0.435%/0.422%，
+网络覆盖率中位数约 98.5%–98.7%。额外结构约束有小幅平直度收益，但混排谱种识别下降，
+且两组在 DeepScores val 的 AD 均从 0.383% 升至约 0.448%；保留两组权重，不切换通用默认权重。
+完整配对比较、局限与困难页对照见 [训练对照报告](reports/structure_ablation_20261115.md)。

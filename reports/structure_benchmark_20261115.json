@@ -1,0 +1,440 @@
+{
+  "validation": {
+    "counts": {
+      "train": 300,
+      "val": 90,
+      "test": 90
+    },
+    "source_groups": 480,
+    "group_overlap": 0,
+    "page_coverage_min": 0.2765299479166667,
+    "page_coverage_mean": 0.5091146469116211,
+    "finite_and_in_range": true
+  },
+  "manifest_sha256": "a8d286b9e2497cf66929c97c707b28d74ba730216ceacdc2f7c19b2fda07fb8e",
+  "summary": [
+    {
+      "dataset": "/Users/haolan/Downloads/MusicAI/score_dewarp/data/prepared/structure_suite_20261115_v2/val",
+      "kind": "jianpu",
+      "method": "input",
+      "samples": 30,
+      "failed": 0,
+      "ad_pct": 3.1516449717212405,
+      "common_ad_pct": null,
+      "local_distortion_pct": 13.674647865452997,
+      "common_local_distortion_pct": null,
+      "coverage": 1.0,
+      "common_coverage": null,
+      "type_accuracy": null,
+      "music": {
+        "coverage": 1.0,
+        "staff_straight": null,
+        "staff_spacing_cv": null,
+        "barline_tilt_deg": 5.741583879186948,
+        "jp_baseline": 1.3906839188306748,
+        "jp_height_cv": 0.0680536881856448,
+        "jp_tilt_deg": 5.199986879960683,
+        "jp_dot_err": 0.07329210355493881,
+        "jp_lyric_err": 0.22222020088432282,
+        "jp_rowgap_cv": 0.11225166235175364
+      },
+      "common_music": {
+        "coverage": null,
+        "staff_straight": null,
+        "staff_spacing_cv": null,
+        "barline_tilt_deg": null,
+        "jp_baseline": null,
+        "jp_height_cv": null,
+        "jp_tilt_deg": null,
+        "jp_dot_err": null,
+        "jp_lyric_err": null,
+        "jp_rowgap_cv": null
+      },
+      "detection": {
+        "staff_precision": null,
+        "staff_recall": null
+      },
+      "detection_counts": {
+        "staff_matched": 0,
+        "staff_pred_count": 0,
+        "staff_gt_count": 0
+      }
+    },
+    {
+      "dataset": "/Users/haolan/Downloads/MusicAI/score_dewarp/data/prepared/structure_suite_20261115_v2/val",
+      "kind": "jianpu",
+      "method": "traditional",
+      "samples": 30,
+      "failed": 0,
+      "ad_pct": 0.8681093028888272,
+      "common_ad_pct": 0.8623824168554459,
+      "local_distortion_pct": 5.9882781901991535,
+      "common_local_distortion_pct": 5.926515757509574,
+      "coverage": 0.7747241910438789,
+      "common_coverage": 0.7747241910438789,
+      "type_accuracy": 0.6666666666666666,
+      "music": {
+        "coverage": 0.9961678574275772,
+        "staff_straight": null,
+        "staff_spacing_cv": null,
+        "barline_tilt_deg": 0.7398622738437557,
+        "jp_baseline": 0.05959028718211534,
+        "jp_height_cv": 0.030616937185387508,
+        "jp_tilt_deg": 0.6693342206865679,
+        "jp_dot_err": 0.010302088168737109,
+        "jp_lyric_err": 0.029468994977914043,
+        "jp_rowgap_cv": 0.024150540280232762
+      },
+      "common_music": {
+        "coverage": 0.995591143281449,
+        "staff_straight": null,
+        "staff_spacing_cv": null,
+        "barline_tilt_deg": 0.7398622738437557,
+        "jp_baseline": 0.05959028718211534,
+        "jp_height_cv": 0.030616937185387508,
+        "jp_tilt_deg": 0.6693342206865679,
+        "jp_dot_err": 0.010302088168737109,
+        "jp_lyric_err": 0.029468994977914043,
+        "jp_rowgap_cv": 0.024150540280232762
+      },
+      "detection": {
+        "staff_precision": null,
+        "staff_recall": null
+      },
+      "detection_counts": {
+        "staff_matched": 0,
+        "staff_pred_count": 0,
+        "staff_gt_count": 0
+      }
+    },
+    {
+      "dataset": "/Users/haolan/Downloads/MusicAI/score_dewarp/data/prepared/structure_suite_20261115_v2/val",
+      "kind": "jianpu",
+      "method": "network_only",
+      "samples": 30,
+      "failed": 0,
+      "ad_pct": 0.8507539106356244,
+      "common_ad_pct": 0.7910382299888181,
+      "local_distortion_pct": 6.279137035725855,
+      "common_local_distortion_pct": 5.7000879523940196,
+      "coverage": 0.9844384295041173,
+      "common_coverage": 0.7747241910438789,
+      "type_accuracy": 0.6333333333333333,
+      "music": {
+        "coverage": 1.0,
+        "staff_straight": null,
+        "staff_spacing_cv": null,
+        "barline_tilt_deg": 1.0657044713972312,
+        "jp_baseline": 0.172521917466177,
+        "jp_height_cv": 0.038592053943534765,
+        "jp_tilt_deg": 1.0821943713159696,
+        "jp_dot_err": 0.020237852217377734,
+        "jp_lyric_err": 0.04895094519233724,
+        "jp_rowgap_cv": 0.025179455855294373
+      },
+      "common_music": {
+        "coverage": 0.995591143281449,
+        "staff_straight": null,
+        "staff_spacing_cv": null,
+        "barline_tilt_deg": 1.0657044713972312,
+        "jp_baseline": 0.1674868438510525,
+        "jp_height_cv": 0.036817044349496196,
+        "jp_tilt_deg": 1.0821943713159696,
+        "jp_dot_err": 0.020237852217377734,
+        "jp_lyric_err": 0.04895094519233724,
+        "jp_rowgap_cv": 0.025179455855294373
+      },
+      "detection": {
+        "staff_precision": null,
+        "staff_recall": null
+      },
+      "detection_counts": {
+        "staff_matched": 0,
+        "staff_pred_count": 0,
+        "staff_gt_count": 0
+      }
+    },
+    {
+      "dataset": "/Users/haolan/Downloads/MusicAI/score_dewarp/data/prepared/structure_suite_20261115_v2/val",
+      "kind": "mixed",
+      "method": "input",
+      "samples": 30,
+      "failed": 0,
+      "ad_pct": 2.994456687504839,
+      "common_ad_pct": null,
+      "local_distortion_pct": 12.159260053547762,
+      "common_local_distortion_pct": null,
+      "coverage": 1.0,
+      "common_coverage": null,
+      "type_accuracy": null,
+      "music": {
+        "coverage": 1.0,
+        "staff_straight": 1.7250484873578178,
+        "staff_spacing_cv": 0.06096967706206567,
+        "barline_tilt_deg": 5.635012963240101,
+        "jp_baseline": 0.9661238285831503,
+        "jp_height_cv": 0.05831016436289769,
+        "jp_tilt_deg": 5.338173368841993,
+        "jp_dot_err": 0.08117629992759118,
+        "jp_lyric_err": 0.22900344450248417,
+        "jp_rowgap_cv": 0.0490669383497289
+      },
+      "common_music": {
+        "coverage": null,
+        "staff_straight": null,
+        "staff_spacing_cv": null,
+        "barline_tilt_deg": null,
+        "jp_baseline": null,
+        "jp_height_cv": null,
+        "jp_tilt_deg": null,
+        "jp_dot_err": null,
+        "jp_lyric_err": null,
+        "jp_rowgap_cv": null
+      },
+      "detection": {
+        "staff_precision": null,
+        "staff_recall": null
+      },
+      "detection_counts": {
+        "staff_matched": 0,
+        "staff_pred_count": 0,
+        "staff_gt_count": 0
+      }
+    },
+    {
+      "dataset": "/Users/haolan/Downloads/MusicAI/score_dewarp/data/prepared/structure_suite_20261115_v2/val",
+      "kind": "mixed",
+      "method": "traditional",
+      "samples": 30,
+      "failed": 0,
+      "ad_pct": 0.9540901445775538,
+      "common_ad_pct": 0.9540901445775538,
+      "local_distortion_pct": 7.363541723210866,
+      "common_local_distortion_pct": 7.309794991006642,
+      "coverage": 0.7556739177582178,
+      "common_coverage": 0.7556739177582178,
+      "type_accuracy": 0.5333333333333333,
+      "music": {
+        "coverage": 0.9979859663063104,
+        "staff_straight": 0.09514561795623436,
+        "staff_spacing_cv": 0.023691164759321433,
+        "barline_tilt_deg": 1.2242876765671666,
+        "jp_baseline": 0.04402228406773076,
+        "jp_height_cv": 0.023337953577456143,
+        "jp_tilt_deg": 1.0201400569167878,
+        "jp_dot_err": 0.017869836494314836,
+        "jp_lyric_err": 0.04748083499384472,
+        "jp_rowgap_cv": 0.010059859342963443
+      },
+      "common_music": {
+        "coverage": 0.9979859663063104,
+        "staff_straight": 0.09514561795623436,
+        "staff_spacing_cv": 0.023691164759321433,
+        "barline_tilt_deg": 1.2242876765671666,
+        "jp_baseline": 0.04402228406773076,
+        "jp_height_cv": 0.023337953577456143,
+        "jp_tilt_deg": 1.0201400569167878,
+        "jp_dot_err": 0.017869836494314836,
+        "jp_lyric_err": 0.04748083499384472,
+        "jp_rowgap_cv": 0.010059859342963443
+      },
+      "detection": {
+        "staff_precision": 1.0,
+        "staff_recall": 1.0
+      },
+      "detection_counts": {
+        "staff_matched": 79,
+        "staff_pred_count": 84,
+        "staff_gt_count": 110
+      }
+    },
+    {
+      "dataset": "/Users/haolan/Downloads/MusicAI/score_dewarp/data/prepared/structure_suite_20261115_v2/val",
+      "kind": "mixed",
+      "method": "network_only",
+      "samples": 30,
+      "failed": 0,
+      "ad_pct": 0.8890678102913654,
+      "common_ad_pct": 0.8695442481815242,
+      "local_distortion_pct": 6.879238848297805,
+      "common_local_distortion_pct": 6.048963051742568,
+      "coverage": 0.9855946122644526,
+      "common_coverage": 0.7556739177582178,
+      "type_accuracy": 0.6,
+      "music": {
+        "coverage": 1.0,
+        "staff_straight": 0.2549502421523277,
+        "staff_spacing_cv": 0.03456423490785318,
+        "barline_tilt_deg": 1.2881405705571671,
+        "jp_baseline": 0.1354287494914712,
+        "jp_height_cv": 0.03244252835087857,
+        "jp_tilt_deg": 1.0621467587019877,
+        "jp_dot_err": 0.02010575606416609,
+        "jp_lyric_err": 0.04513757318262448,
+        "jp_rowgap_cv": 0.01569655191033796
+      },
+      "common_music": {
+        "coverage": 0.9979859663063104,
+        "staff_straight": 0.2549502421523277,
+        "staff_spacing_cv": 0.03456423490785318,
+        "barline_tilt_deg": 1.279677813361109,
+        "jp_baseline": 0.1354287494914712,
+        "jp_height_cv": 0.03244252835087857,
+        "jp_tilt_deg": 1.0621467587019877,
+        "jp_dot_err": 0.02010575606416609,
+        "jp_lyric_err": 0.04513757318262448,
+        "jp_rowgap_cv": 0.01569655191033796
+      },
+      "detection": {
+        "staff_precision": 1.0,
+        "staff_recall": 1.0
+      },
+      "detection_counts": {
+        "staff_matched": 85,
+        "staff_pred_count": 89,
+        "staff_gt_count": 110
+      }
+    },
+    {
+      "dataset": "/Users/haolan/Downloads/MusicAI/score_dewarp/data/prepared/structure_suite_20261115_v2/val",
+      "kind": "staff",
+      "method": "input",
+      "samples": 30,
+      "failed": 0,
+      "ad_pct": 2.7767297815255487,
+      "common_ad_pct": null,
+      "local_distortion_pct": 11.387083229203654,
+      "common_local_distortion_pct": null,
+      "coverage": 1.0,
+      "common_coverage": null,
+      "type_accuracy": null,
+      "music": {
+        "coverage": 1.0,
+        "staff_straight": 1.9874693920110316,
+        "staff_spacing_cv": 0.0608473680316609,
+        "barline_tilt_deg": 3.6962444161414068,
+        "jp_baseline": null,
+        "jp_height_cv": null,
+        "jp_tilt_deg": null,
+        "jp_dot_err": null,
+        "jp_lyric_err": null,
+        "jp_rowgap_cv": null
+      },
+      "common_music": {
+        "coverage": null,
+        "staff_straight": null,
+        "staff_spacing_cv": null,
+        "barline_tilt_deg": null,
+        "jp_baseline": null,
+        "jp_height_cv": null,
+        "jp_tilt_deg": null,
+        "jp_dot_err": null,
+        "jp_lyric_err": null,
+        "jp_rowgap_cv": null
+      },
+      "detection": {
+        "staff_precision": null,
+        "staff_recall": null
+      },
+      "detection_counts": {
+        "staff_matched": 0,
+        "staff_pred_count": 0,
+        "staff_gt_count": 0
+      }
+    },
+    {
+      "dataset": "/Users/haolan/Downloads/MusicAI/score_dewarp/data/prepared/structure_suite_20261115_v2/val",
+      "kind": "staff",
+      "method": "traditional",
+      "samples": 30,
+      "failed": 0,
+      "ad_pct": 1.113483755979717,
+      "common_ad_pct": 1.113483755979717,
+      "local_distortion_pct": 5.86524162529364,
+      "common_local_distortion_pct": 5.86524162529364,
+      "coverage": 0.7091106716120579,
+      "common_coverage": 0.7091106716120579,
+      "type_accuracy": 0.9333333333333333,
+      "music": {
+        "coverage": 0.9862328802234768,
+        "staff_straight": 0.07661330824943569,
+        "staff_spacing_cv": 0.021091873583738624,
+        "barline_tilt_deg": 1.8618350557096823,
+        "jp_baseline": null,
+        "jp_height_cv": null,
+        "jp_tilt_deg": null,
+        "jp_dot_err": null,
+        "jp_lyric_err": null,
+        "jp_rowgap_cv": null
+      },
+      "common_music": {
+        "coverage": 0.9862328802234768,
+        "staff_straight": 0.07661330824943569,
+        "staff_spacing_cv": 0.021091873583738624,
+        "barline_tilt_deg": 1.8618350557096823,
+        "jp_baseline": null,
+        "jp_height_cv": null,
+        "jp_tilt_deg": null,
+        "jp_dot_err": null,
+        "jp_lyric_err": null,
+        "jp_rowgap_cv": null
+      },
+      "detection": {
+        "staff_precision": 1.0,
+        "staff_recall": 0.8333333333333334
+      },
+      "detection_counts": {
+        "staff_matched": 134,
+        "staff_pred_count": 138,
+        "staff_gt_count": 188
+      }
+    },
+    {
+      "dataset": "/Users/haolan/Downloads/MusicAI/score_dewarp/data/prepared/structure_suite_20261115_v2/val",
+      "kind": "staff",
+      "method": "network_only",
+      "samples": 30,
+      "failed": 0,
+      "ad_pct": 1.0748110651969855,
+      "common_ad_pct": 0.9969574139488735,
+      "local_distortion_pct": 7.449917988906495,
+      "common_local_distortion_pct": 6.415354030201001,
+      "coverage": 0.985217638013312,
+      "common_coverage": 0.7091106716120579,
+      "type_accuracy": 0.9666666666666667,
+      "music": {
+        "coverage": 1.0,
+        "staff_straight": 0.26444804354027807,
+        "staff_spacing_cv": 0.033573819277818356,
+        "barline_tilt_deg": 1.050820287867631,
+        "jp_baseline": null,
+        "jp_height_cv": null,
+        "jp_tilt_deg": null,
+        "jp_dot_err": null,
+        "jp_lyric_err": null,
+        "jp_rowgap_cv": null
+      },
+      "common_music": {
+        "coverage": 0.9862328802234768,
+        "staff_straight": 0.2632189120841213,
+        "staff_spacing_cv": 0.033644607248702774,
+        "barline_tilt_deg": 1.051822586994714,
+        "jp_baseline": null,
+        "jp_height_cv": null,
+        "jp_tilt_deg": null,
+        "jp_dot_err": null,
+        "jp_lyric_err": null,
+        "jp_rowgap_cv": null
+      },
+      "detection": {
+        "staff_precision": 1.0,
+        "staff_recall": 1.0
+      },
+      "detection_counts": {
+        "staff_matched": 144,
+        "staff_pred_count": 147,
+        "staff_gt_count": 188
+      }
+    }
+  ]
+}
