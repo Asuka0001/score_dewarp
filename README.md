@@ -491,3 +491,17 @@ test 只评测一次，模型和 C 的参数都已按验证集固定。完整表
 1. 所有形变都是合成的。0.37% 的 AD 只代表合成分布内的表现，**下一步最重要的是真实手机照片评测**（第 7 节第 1 项）。
 2. DeepScores 只有五线谱；简谱和混排页面仍依赖传统方案，需要相应的训练数据。
 3. 单 seed 的全量训练；未跑满学习率周期。
+
+## 12. 结构评测与谱线检测修复（2026-11-15）
+
+新增统一评测 `scripts/evaluate_materials.py`：几何误差、共同有效点比较、谱线平直度/线距、小节线倾角、简谱基线/字高/字符倾角/点与歌词误差，以及有标注时的谱表实例 precision / recall。缺失标注不计零分，结构关键点覆盖率单独记录。
+
+修复浅色谱线丢失、断裂谱线分组及标题缺字方框误识别为 0。固定的 172 张 DeepScores val 校正图上，谱种正确输出从 57/172 提高到 160/172，无正确页面退化；仍有 12 张 unknown。该结果衡量谱种输出，不代表所有谱表和关键点准确。
+
+改进检测用于最终谱种、区域、关键点导出；B/C 保持原有观测规则，避免未校准的恢复线改变几何拟合。32 项单元测试通过。详细设计、局限、复现命令及最终结果目录见 [结构评测报告](reports/structure_evaluation.md)。
+
+```bash
+.venv/bin/python scripts/evaluate_materials.py --data data/synth \
+  --checkpoint outputs/deepscores_finetune/full_ca_lr1e-3_s7/best.pt \
+  --out outputs/materials_new --save-images
+```

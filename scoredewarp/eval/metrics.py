@@ -46,12 +46,32 @@ def _ang_from_vertical(top, bot):
     return np.degrees(np.abs(np.arctan2(d[:, 0], -d[:, 1])))
 
 
-def evaluate(gt: dict, fwd) -> dict:
+def evaluate(gt: dict, fwd, *, point_valid=None, out_size=None) -> dict:
+    """Measure annotated structures, optionally on a shared set of photo points.
+
+    ``point_valid(photo_points)`` excludes points before computing any metric;
+    use the intersection of two methods' validity for paired comparisons.
+    ``out_size=(width, height)`` also rejects finite points outside the canvas.
+    Missing labels produce no metrics, rather than a perfect zero error.
+    """
     flat_ann, photo_ann = gt["flat_ann"], gt["photo_ann"]
     page_w = gt["meta"]["size"][0]
-    out = []
-    for a in photo_ann:
-        out.append(fwd(np.asarray(a["pts"], float)))
+    if not photo_ann:
+        return {}
+    # Evaluate all annotations in one batch: per-glyph remap/mask calls are
+    # expensive and needlessly repeat the same inversion validity checks.
+    lengths = [len(a["pts"]) for a in photo_ann]
+    points = np.concatenate([np.asarray(a["pts"], float).reshape(-1, 2) for a in photo_ann])
+    if not len(points):
+        return {}
+    mapped = np.asarray(fwd(points), float).copy()
+    keep = np.isfinite(mapped).all(1)
+    if point_valid is not None:
+        keep &= np.asarray(point_valid(points), bool)
+    if out_size is not None:
+        keep &= (mapped >= 0).all(1) & (mapped < np.asarray(out_size)).all(1)
+    mapped[~keep] = np.nan
+    out = np.split(mapped, np.cumsum(lengths)[:-1])
     flat = [np.asarray(a["pts"], float) for a in flat_ann]
     kinds = [a["kind"] for a in flat_ann]
     m = {}
@@ -63,13 +83,23 @@ def evaluate(gt: dict, fwd) -> dict:
         if k in keyk:
             F.append(f)
             O.append(o)
+    if not F:
+        return {}  # e.g. DeepScores geometry-only labels
     F, O = np.concatenate(F), np.concatenate(O)
     ok = np.isfinite(O).all(1)
     m["coverage"] = float(ok.mean())
+    m["keypoints_total"] = len(ok)
+    m["keypoints_valid"] = int(ok.sum())
+    for name in ("staff_line", "barline", "jp_char", "lyric_char"):
+        coords = [o for k, o in zip(kinds, out) if k == name]
+        if coords:
+            good = np.isfinite(np.concatenate(coords)).all(1)
+            m[name + "_coverage"] = float(good.mean())
     if ok.sum() > 10:
         s, R, t = _similarity_fit(F[ok], O[ok])
         res = O[ok] - (s * F[ok] @ R.T + t)
-        m["ad_pct"] = float(np.sqrt((res ** 2).sum(1).mean()) / (s * page_w) * 100)
+        if s > 1e-12:
+            m["ad_pct"] = float(np.sqrt((res ** 2).sum(1).mean()) / (s * page_w) * 100)
 
     # ---- staff ------------------------------------------------------------------
     staff = {}
@@ -83,7 +113,10 @@ def evaluate(gt: dict, fwd) -> dict:
                 continue
             L = np.stack([lines[i] for i in range(5)])        # (5, n, 2)
             dy = np.diff(L[:, :, 1], axis=0)                   # (4, n)
-            sp = np.nanmedian(dy)
+            finite_dy = dy[np.isfinite(dy)]
+            if not finite_dy.size:
+                continue
+            sp = np.median(finite_dy)
             if not np.isfinite(sp) or sp <= 0:
                 continue
             for i in range(5):
@@ -116,7 +149,9 @@ def evaluate(gt: dict, fwd) -> dict:
         h = np.linalg.norm(top - bot, axis=1)
         fh = np.linalg.norm(ftop - fbot, axis=1)
         g = np.isfinite(h)
-        hmed = np.nanmedian(h)
+        if not g.any() or np.median(h[g]) <= 1e-12:
+            return m
+        hmed = np.median(h[g])
         m["jp_height_cv"] = float(np.std(h[g]) / np.mean(h[g]))
         m["jp_tilt_deg"] = float(np.mean(_ang_from_vertical(top[g], bot[g])))
         rows = {}

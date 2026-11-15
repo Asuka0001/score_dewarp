@@ -46,6 +46,20 @@ class HybridTests(unittest.TestCase):
         self.assertIs(result.bmap, initial)
         np.testing.assert_array_equal(result.image, photo)
 
+    def test_faint_staff_recovery_updates_exports_without_warping_identity(self):
+        import cv2
+        photo = np.full((360, 600, 3), 255, np.uint8)
+        for i in range(5):
+            cv2.line(photo, (30, 60 + 10 * i), (570, 60 + 10 * i), (220, 220, 220), 2)
+        for x in range(80, 550, 70):
+            cv2.ellipse(photo, (x, 85), (7, 5), 0, 0, 360, (20, 20, 20), -1)
+        initial = BackwardMap.from_homography(np.eye(3), (600, 360))
+        result = refine_dewarp(photo, initial, Config(use_field=False))
+        self.assertIs(result.bmap, initial)
+        self.assertEqual(result.page_type, 'staff')
+        self.assertEqual(len(result.structures.staves), 1)
+        np.testing.assert_array_equal(result.image, photo)
+
 
 if __name__ == "__main__":
     unittest.main()

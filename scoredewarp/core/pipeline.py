@@ -49,11 +49,11 @@ class Result:
         return self.bmap.forward_points(pts)
 
 
-def _detect(img):
+def _detect(img, *, robust=True):
     norm = normalize_illumination(to_gray(img))
     valid = (to_gray(img) > 0).astype(np.uint8) if img.ndim == 2 else None
     ink = binarize(norm)
-    return norm, ink, detect_structures(norm, ink)
+    return norm, ink, detect_structures(norm, ink, robust=robust)
 
 
 def _filter_structures(S: Structures, priors):
@@ -105,7 +105,9 @@ def dewarp(img: np.ndarray, cfg: Config | None = None, verbose=False) -> Result:
     cur = I1
     if cfg.use_surface:
         t = time.time()
-        _, _, S1 = _detect(I1)
+        # Keep the fitted geometry's established evidence distribution. Faint
+        # line recovery is enabled for final exported structures below.
+        _, _, S1 = _detect(I1, robust=False)
         S1f = _filter_structures(S1, cfg.surface_priors)
         sm = SurfaceModel((W0, H0))
         n = sm.build(S1f, Hc)
@@ -147,7 +149,7 @@ def _finish(img, cur, bm, cfg, stages, T, t0, verbose):
     if cfg.use_field:
         t = time.time()
         for _ in range(cfg.field_iters):
-            _, _, S2 = _detect(cur)
+            _, _, S2 = _detect(cur, robust=False)
             S2f = _filter_structures(S2, cfg.field_priors)
             fb = fit_field(S2f, node=cfg.field_node, priors=cfg.field_priors)
             if fb is None:

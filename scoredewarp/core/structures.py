@@ -260,7 +260,7 @@ def _interp_frag(f, x):
     return float(np.interp(x, p[:, 0], p[:, 1]))
 
 
-def group_staves(frags, W, spacing_hint):
+def group_staves(frags, W, spacing_hint, *, bridge_gaps=True):
     """5 equally spaced fragments at many columns -> staves (union-find)."""
     step = max(8, int(spacing_hint) if spacing_hint else 12)
     parent = list(range(len(frags)))
@@ -295,6 +295,30 @@ def group_staves(frags, W, spacing_hint):
                 i += 5
             else:
                 i += 1
+    # Symbols and barlines interrupt all five tracks at once. Such sections
+    # share no fragment IDs, so fragment union alone splits a genuine staff
+    # into short groups that fail the page-span check below. Join neighbouring
+    # five-line observations only when their spacing and vertical position
+    # agree. Never invent line points inside the gap.
+    recent = []
+    for x, yy, fids in (tuples if bridge_gaps else ()):
+        sp = float(np.median(np.diff(yy)))
+        recent = [t for t in recent if x - t[0] <= 6 * step]
+        candidates = []
+        for px, py, pf in recent:
+            if px == x:
+                continue
+            psp = float(np.median(np.diff(py)))
+            if abs(sp - psp) > 0.2 * min(sp, psp) + 0.5:
+                continue
+            delta = np.abs(yy - py)
+            limit = min(0.75 * min(sp, psp), 2 + 0.35 * (x - px))
+            if delta.max() <= limit:
+                candidates.append((x - px, float(delta.mean()), pf))
+        if candidates:
+            _, _, previous = min(candidates, key=lambda c: c[:2])
+            parent[find(fids[0])] = find(previous[0])
+        recent.append((x, yy, fids))
     groups = {}
     for x, yy, fids in tuples:
         groups.setdefault(find(fids[0]), []).append((x, yy, fids))
@@ -359,9 +383,23 @@ def _digit_templates():
     return _TEMPLATES
 
 
-def classify_digit(crop):
+def classify_digit(crop, *, reject_boxes=True):
     h, w = crop.shape
     asp = w / max(h, 1)
+    # Missing-font boxes in score titles resemble "0" after resizing. Their
+    # rectangular outer contour plus enclosed hole distinguishes them from a
+    # rounded digit without suppressing legitimate all-rest (0000) rows.
+    contours, hierarchy = cv2.findContours(crop.astype(np.uint8), cv2.RETR_CCOMP,
+                                          cv2.CHAIN_APPROX_SIMPLE)
+    if reject_boxes and hierarchy is not None:
+        for i, contour in enumerate(contours):
+            if hierarchy[0, i, 3] >= 0 or hierarchy[0, i, 2] < 0:
+                continue
+            rect = cv2.minAreaRect(contour)
+            area = rect[1][0] * rect[1][1]
+            approx = cv2.approxPolyDP(contour, .03 * cv2.arcLength(contour, True), True)
+            if area > 0 and cv2.contourArea(contour) / area > .87 and len(approx) == 4:
+                return None, -1.
     t = cv2.resize(crop.astype(np.float32), (16, 24), interpolation=cv2.INTER_AREA)
     t = (t - t.mean()) / (t.std() + 1e-6)
     best, bch = -1.0, None
@@ -385,7 +423,7 @@ def staff_band_mask(shape, staves, margin_sp=2.6):
     return m
 
 
-def find_text_rows(ink, line_len, band):
+def find_text_rows(ink, line_len, band, *, reject_boxes=True):
     # remove only pixels belonging to long, strictly horizontal runs (underlines,
     # 减时线, ledger/staff remnants) without eroding the glyphs touching them
     lines = directional_open(ink, line_len, True, angles=(-2, 0, 2), thicken=False)
@@ -441,7 +479,7 @@ def find_text_rows(ink, line_len, band):
         for b in rb:
             crop = (lab[int(b.y0):int(b.y1), int(b.x0):int(b.x1)] == b._lab)
             if 0.75 * hmed <= b.h <= 1.3 * hmed:
-                b.digit, _ = classify_digit(crop)
+                b.digit, _ = classify_digit(crop, reject_boxes=reject_boxes)
                 n_dig += b.digit is not None
         kind = "jianpu" if (n_dig >= 4 and n_dig >= 0.55 * len(rb)) else "text"
         full = [k for k, b in enumerate(rb) if 0.8 * hmed <= b.h <= 1.25 * hmed]
@@ -450,16 +488,37 @@ def find_text_rows(ink, line_len, band):
     return rows, h_mode
 
 
-def detect_structures(norm: np.ndarray, ink: np.ndarray) -> Structures:
+def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True) -> Structures:
+    """Detect exported structures; ``robust=False`` preserves optimizer evidence.
+
+    Recovered faint/broken lines are useful for page type and annotations, but
+    do not yet have calibrated confidence for driving B/C's deformation fit.
+    """
     H, W = ink.shape
     thick, sp = run_metrics(ink)
     frags_pts, hmask = find_fragments(ink, thick, sp if sp else 12, horizontal=True)
     frags = [Fragment(p) for p in frags_pts]
-    staves = group_staves(frags, W, sp if sp else None)
+    staves = group_staves(frags, W, sp if sp else None, bridge_gaps=robust)
+    if robust and not staves:
+        # Global Otsu is dominated by dark noteheads. On blurred/downsampled
+        # scores the thin grey staff lines can be brighter than its threshold,
+        # so no grouping algorithm can recover them from `ink`. Use local
+        # contrast only for horizontal evidence; leave digit/text masks intact.
+        block = max(15, min(H, W) // 50) | 1
+        local_ink = cv2.adaptiveThreshold(norm, 1, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                        cv2.THRESH_BINARY_INV, block, 5)
+        local_thick, local_sp = run_metrics(local_ink)
+        local_pts, _ = find_fragments(local_ink, local_thick, local_sp or 12)
+        local_frags = [Fragment(p) for p in local_pts]
+        local_staves = group_staves(local_frags, W, local_sp or None)
+        if local_staves:
+            frags, staves = local_frags, local_staves
+            thick = local_thick
     if staves:
         sp = float(np.median([s.spacing for s in staves]))
     band = staff_band_mask(ink.shape, staves)
-    rows, h_mode = find_text_rows(ink, int(max(25, 3 * (sp or 12))), band)
+    rows, h_mode = find_text_rows(ink, int(max(25, 3 * (sp or 12))), band,
+                                 reject_boxes=robust)
     jp_rows = [r for r in rows if r.kind == "jianpu"]
     cands = []
     if staves:
@@ -498,7 +557,9 @@ def _classify_page(S: Structures):
     regs = []
     for st in S.staves:
         x0, x1 = st.x_range
-        ys = np.concatenate([np.polyval(st.top_poly, [x0, x1]), np.polyval(st.bot_poly, [x0, x1])])
+        # Include interior extrema of curved staves, not just their endpoints.
+        xs = np.linspace(x0, x1, 40)
+        ys = np.concatenate([np.polyval(st.top_poly, xs), np.polyval(st.bot_poly, xs)])
         y0, y1 = ys.min() - 2 * st.spacing, ys.max() + 2 * st.spacing
         regs.append(("staff", np.array([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], float)))
     for r in S.rows:

@@ -62,15 +62,48 @@ def geometry_metrics(target, predicted, valid, predicted_valid=None):
     return result
 
 
+def map_points(bmap, points, *, page_valid=None, roundtrip_tolerance=2.):
+    """Evaluate an actual output map with canvas and inverse-consistency checks.
+
+    Apply the same checks to classical and learned maps. A finite scattered
+    inverse alone can bridge a hole or fold and overstate coverage.
+    """
+    points = np.asarray(points)
+    pred = bmap.forward_points(points.reshape(-1, 2)).reshape(points.shape)
+    keep = np.isfinite(pred).all(-1) & (pred >= 0).all(-1)
+    keep &= (pred < np.asarray(bmap.out_size)).all(-1)
+    if page_valid is not None:
+        keep &= page_valid
+    roundtrip = bmap.sample(pred.reshape(-1, 2)).reshape(points.shape)
+    keep &= np.linalg.norm(roundtrip - points, axis=-1) <= roundtrip_tolerance
+    return pred, keep
+
+
+def paired_geometry_metrics(target, predictions, valid):
+    """Return each method's errors on the identical intersection of valid points.
+
+    ``predictions`` maps method names to (coordinates, validity) pairs. Empty
+    intersections retain zero coverage and undefined errors.
+    """
+    common = np.asarray(valid, bool).copy()
+    for pred, keep in predictions.values():
+        common &= keep & np.isfinite(pred).all(-1)
+    return {name: geometry_metrics(target, pred, valid, common)
+            for name, (pred, _) in predictions.items()}
+
+
 def network_points(out, photo_points, photo_size, aspect):
     field = out["fwd"][0].detach().cpu().numpy().transpose(1, 2, 0)
     prob = out["page"][0, 0].detach().sigmoid().cpu().numpy()
     h, w = field.shape[:2]
     xy = (photo_points / np.array(photo_size) * [w, h]).astype(np.float32)
-    coords = cv2.remap(field, xy[..., 0], xy[..., 1], cv2.INTER_LINEAR,
-                       borderMode=cv2.BORDER_REPLICATE) * [1, aspect]
-    page = cv2.remap(prob, xy[..., 0], xy[..., 1], cv2.INTER_LINEAR,
-                     borderMode=cv2.BORDER_REPLICATE) > .5
+    # OpenCV treats a 1-D remap as an N x 1 image. Flatten explicitly so both
+    # regular evaluation grids and annotation point lists preserve their shape.
+    mx, my = xy[..., 0].reshape(-1, 1), xy[..., 1].reshape(-1, 1)
+    coords = cv2.remap(field, mx, my, cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_REPLICATE).reshape(photo_points.shape) * [1, aspect]
+    page = cv2.remap(prob, mx, my, cv2.INTER_LINEAR,
+                     borderMode=cv2.BORDER_REPLICATE).reshape(photo_points.shape[:-1]) > .5
     return coords, page
 
 
