@@ -16,8 +16,35 @@ def load(ckpt, device="cpu"):
     sd = torch.load(ckpt, map_location=device)
     net = build_model(sd)
     net.load_state_dict(sd["model"])
+    net.auxiliary_heads = sd.get("auxiliary_heads", {})
     net.eval().to(device)
     return net, sd.get("size", (384, 512))
+
+
+def kind_decision(net, out, detector_type="unknown"):
+    """Use a validated kind head at fixed confidence, otherwise keep detection."""
+    metadata = getattr(net, "auxiliary_heads", {}).get("kind", {})
+    logits = out["kind"][0].detach()
+    finite = bool(torch.isfinite(logits).all())
+    probabilities = logits.softmax(0) if finite else None
+    confidence = float(probabilities.max()) if finite else None
+    predicted = KIND_NAMES[int(probabilities.argmax())] if finite else "unknown"
+    threshold = metadata.get("confidence_threshold", .8)
+    valid_threshold = isinstance(threshold, (int, float)) and np.isfinite(threshold) and 0 <= threshold <= 1
+    ready = bool(metadata.get("trained") and metadata.get("ready") and metadata.get("deployment_geometry_passed"))
+    use = bool(ready and finite and valid_threshold and confidence >= threshold)
+    return {"page_type": predicted if use else detector_type,
+            "source": "network_kind" if use else "structure_detector",
+            "detector_page_type": detector_type, "network_page_type": predicted,
+            "confidence": confidence, "threshold": threshold if valid_threshold else None,
+            "validated_head": ready}
+
+
+def apply_kind_decision(result, net, out):
+    decision = kind_decision(net, out, result.structures.page_type)
+    result.page_type = decision["page_type"]
+    result.stages["kind_decision"] = decision
+    return result
 
 
 @torch.no_grad()

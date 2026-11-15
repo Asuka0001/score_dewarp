@@ -39,7 +39,7 @@ def main():
     cfg = Config(use_page_quad=not args.no_quad, use_surface=not args.no_surface, use_field=not args.no_field,
                  test_rot90=args.rot90)
     if args.checkpoint:
-        from scoredewarp.learn.infer import load, predict
+        from scoredewarp.learn.infer import load, predict, apply_kind_decision
         net, size = load(args.checkpoint)
         cfg.use_field = not (args.no_field or args.network_only)
     for path in args.inputs:
@@ -52,9 +52,10 @@ def main():
             name = os.path.basename(os.path.dirname(os.path.abspath(path)))
         if args.checkpoint:
             start = time.perf_counter()
-            bm, _, _ = predict(net, img, size, out_size=(1600, 2263))
+            bm, _, raw = predict(net, img, size, out_size=(1600, 2263))
             network_time = time.perf_counter() - start
             res = refine_dewarp(img, bm, cfg)
+            apply_kind_decision(res, net, raw)
             res.timings["network_init"] = network_time
             res.timings["total"] += network_time
             res.stages["checkpoint"] = os.path.abspath(args.checkpoint)

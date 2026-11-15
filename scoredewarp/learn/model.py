@@ -42,6 +42,15 @@ def _block(ci, co):
                          nn.Conv2d(co, co, 3, padding=1, bias=False), nn.BatchNorm2d(co), nn.ReLU(inplace=True))
 
 
+def _spatial_head(channels, outputs, dilations):
+    layers = []
+    for dilation in dilations:
+        layers += [nn.Conv2d(channels, 16, 3, padding=dilation, dilation=dilation),
+                   nn.GroupNorm(4, 16), nn.ReLU(inplace=True)]
+        channels = 16
+    return nn.Sequential(*layers, nn.Conv2d(channels, outputs, 1))
+
+
 def _pos_encoding(h, w, dim, device, dtype):
     """Sinusoidal 2D encoding of normalised [0,1] positions (resolution independent)."""
     n = dim // 4
@@ -73,12 +82,16 @@ class GlobalContext(nn.Module):
 
 
 class ScoreDewarpNet(nn.Module):
-    def __init__(self, ch=(32, 64, 128, 256, 256), context="none", context_layers=2, coord_input=False):
+    def __init__(self, ch=(32, 64, 128, 256, 256), context="none", context_layers=2, coord_input=False,
+                 auxiliary_context=False):
         super().__init__()
         if context not in ("none", "attn"):
             raise ValueError(f"Unknown context {context!r}")
         self.arch = {"ch": list(ch), "context": context, "context_layers": context_layers,
                      "coord_input": bool(coord_input)}
+        self.auxiliary_context = bool(auxiliary_context)
+        if auxiliary_context:
+            self.arch["auxiliary_context"] = True
         self.coord_input = bool(coord_input)
         self.context = GlobalContext(ch[-1], context_layers) if context == "attn" else None
         self.enc = nn.ModuleList()
@@ -91,12 +104,13 @@ class ScoreDewarpNet(nn.Module):
             self.dec.append(_block(ch[i] + ch[i - 1], ch[i - 1]))
         c0 = ch[0]
         self.head_fwd = nn.Conv2d(c0, 3, 1)
-        self.head_seg = nn.Conv2d(c0, 5, 1)
-        self.head_struct = nn.Conv2d(c0, 3, 1)
+        self.head_seg = (_spatial_head(c0 + 3, 5, (1, 2)) if auxiliary_context else nn.Conv2d(c0, 5, 1))
+        self.head_struct = (_spatial_head(c0 + 3, 3, (1, 2, 4)) if auxiliary_context else nn.Conv2d(c0, 3, 1))
         self.head_kind = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(ch[-1], 64), nn.ReLU(),
                                        nn.Linear(64, 3))
 
-    def forward(self, x):
+    def forward_features(self, x):
+        """Return decoder and bottleneck features without changing geometry."""
         if self.coord_input:
             b, _, h, w = x.shape
             ys = torch.linspace(-1, 1, h, device=x.device, dtype=x.dtype).view(1, 1, h, 1).expand(b, 1, h, w)
@@ -108,14 +122,21 @@ class ScoreDewarpNet(nn.Module):
             feats.append(x)
         if self.context is not None:
             x = self.context(x)
-        kind = self.head_kind(x)
+        bottleneck = x
         for j, b in enumerate(self.dec):
             skip = feats[-2 - j]
             x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
             x = b(torch.cat([x, skip], 1))
+        return x, bottleneck
+
+    def forward(self, x):
+        image = x
+        x, bottleneck = self.forward_features(x)
+        kind = self.head_kind(bottleneck)
         f = self.head_fwd(x)
-        return {"fwd": torch.sigmoid(f[:, :2]), "page": f[:, 2:3], "seg": self.head_seg(x),
-                "struct": self.head_struct(x), "kind": kind}
+        auxiliary = torch.cat([x, image], 1) if self.auxiliary_context else x
+        return {"fwd": torch.sigmoid(f[:, :2]), "page": f[:, 2:3], "seg": self.head_seg(auxiliary),
+                "struct": self.head_struct(auxiliary), "kind": kind}
 
 
 def build_model(checkpoint=None, **arch):

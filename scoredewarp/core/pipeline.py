@@ -173,6 +173,7 @@ def result_json(res: Result):
     S = res.structures
     out = {
         "page_type": res.page_type,
+        "page_type_source": res.stages.get("kind_decision", {}).get("source", "structure_detector"),
         "summary": S.summary(),
         "regions": [{"type": t, "polygon": np.round(p, 1).tolist()} for t, p in S.regions],
         "staves": [{"spacing": st.spacing,

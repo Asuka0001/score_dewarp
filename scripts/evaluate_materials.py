@@ -25,7 +25,7 @@ from scoredewarp.eval.geometry import (sample_geometry, geometry_metrics, map_po
                                        network_points, paired_geometry_metrics, orientation_error_rate)
 from scoredewarp.eval.metrics import evaluate
 from scoredewarp.eval.structures import staff_detection_metrics
-from scoredewarp.learn.infer import load, predict
+from scoredewarp.learn.infer import load, predict, apply_kind_decision
 
 STRUCTURE_KEYS = ("coverage", "staff_straight", "staff_spacing_cv", "barline_tilt_deg", "jp_baseline",
                   "jp_height_cv", "jp_tilt_deg", "jp_dot_err", "jp_lyric_err", "jp_rowgap_cv")
@@ -53,6 +53,7 @@ def measure(folder, net, size, width, save_dir=None, *, networks=None):
                     model, model_size = networks[name]
                     bm, _, raw = predict(model, image, model_size, out_size=(width, round(width * 2263 / 1600)))
                     result = refine_dewarp(image, bm, Config(use_field=False))
+                    apply_kind_decision(result, model, raw)
                 row["time_s"] = time.perf_counter() - start
                 bm = result.bmap
                 # Capture bmap/raw in defaults: maps remain valid after this loop.
