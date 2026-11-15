@@ -571,3 +571,26 @@ data_only **0.6823%**、structure_consistency **0.6799%**。
 JSON 的 `page_type_source` 与 `stages.kind_decision` 记录来源和置信度；`summary` 仍描述手工检测结构。
 旧权重缺少验证元数据时不启用 kind 头。
 完整双域规则、训练复现、分通道 precision/recall/AP、局限与可视化见 [辅助头报告](reports/auxiliary_20261115.md)。
+
+## 15. 结构热图阈值校准与独立验证（2026-11-15）
+
+在已有 90 页开发验证集上分别校准三个结构通道的阈值，锁定后生成另 90 页独立合成素材。
+谱线/简谱基线/竖线阈值为 **0.86/0.95/0.98**；新素材严格像素宏 F1 从 **0.307 → 0.458**，
+1px 容差宏 F1 从 **0.523 → 0.688**，五档条件均改善。方向压细对照不如仅阈值方案，保持可选。
+简谱基线严格像素召回从 93.9% 降到 36.0%，因此仍仅供独立结构诊断，不接入几何精修。
+
+```bash
+# 新空目录；校准参数锁定后才生成独立验证素材，不读取旧测试图像/标签。
+.venv/bin/python scripts/calibrate_structure.py --out outputs/structure_calibration_repeat
+
+# 导出三通道掩码、概率及叠加图，坐标为模型输入像素（384×512）。
+.venv/bin/python scripts/predict_structures.py \
+  outputs/structure_calibration_20261115/fresh/val/jianpu_blur_000/photo.jpg \
+  --checkpoint outputs/auxiliary_20261115/original_spatial/validated.pt \
+  --calibration outputs/structure_calibration_20261115/selected.json \
+  --out outputs/structure_masks_demo
+```
+
+导出工具校验权重哈希与校准分辨率，不改动既有校正流程或权重。
+本轮新增 4 项后处理测试，合计 49 项测试通过。
+完整结果、召回代价、复现协议及固定样本对照见 [结构校准报告](reports/structure_calibration_20261115.md)。

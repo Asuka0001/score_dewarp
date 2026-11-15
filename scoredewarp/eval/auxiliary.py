@@ -37,3 +37,22 @@ def heatmap_metrics(tp, predicted, truth):
                        "tp": int(hit), "predicted": int(p), "truth": int(t)})
     values = [r["f1"] for r in result if r["f1"] is not None]
     return {"channels": result, "macro_f1": float(np.mean(values)) if values else None}
+
+
+def structure_count_metrics(counts):
+    """Summarize Cx5 counts: exact TP, predicted, GT, near-GT P, near-P GT."""
+    counts = np.asarray(counts)
+    if counts.shape != (3, 5) or not np.isfinite(counts).all() or (counts < 0).any():
+        raise ValueError("Expected nonnegative finite 3x5 counts")
+    exact = heatmap_metrics(counts[:, 0], counts[:, 1], counts[:, 2])
+    tolerant = []
+    for _, p, t, hitp, hitt in counts:
+        precision = float(hitp / p) if p else 0.
+        recall = float(hitt / t) if t else 0.
+        tolerant.append({"precision": precision if p else None,
+                         "recall": recall if t else None,
+                         "f1": (2*precision*recall/(precision+recall) if precision+recall
+                                else (0. if p+t else None))})
+    values = [r["f1"] for r in tolerant if r["f1"] is not None]
+    return {"exact": exact, "tolerant": {"channels": tolerant,
+            "macro_f1": float(np.mean(values)) if values else None}}
