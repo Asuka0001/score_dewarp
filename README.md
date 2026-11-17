@@ -456,7 +456,7 @@ train/val/test = **2,810/172/137**，363 个曲谱分组，无跨集合重叠，
 ### 首轮网络+C 验证结果（pilot val，64 页）
 
 该历史试验的原始指标位于 `outputs/hybrid/pilot_val/`，早期独立报告已清理。
-当前结果与对照见 [文档方案报告](reports/document_mesh_20261117.md)。本轮 64 页均完成，无异常失败；19 项单元测试通过。
+当前结果与对照见 [文档方案报告](outputs/report_archive_20261117/reports/document_mesh_20261117.md)。本轮 64 页均完成，无异常失败；19 项单元测试通过。
 
 | 方法 | AD % 中位数 | 局部畸变 % 中位数 | 平均覆盖率 |
 |---|---:|---:|---:|
@@ -628,7 +628,7 @@ JSON 的 `page_type_source` 与 `stages.kind_decision` 记录来源和置信度�
 
 原始数据保存在被 Git 忽略的 `data/external/cpms/`；完整对照、逐页诊断与映射在 `outputs/cpms_20261115/`。
 该轮原始结果保存在 `outputs/cpms_20261115/`；早期报告与三页缩略图已由
-[当前完整报告](reports/document_mesh_20261117.md)和[全部 60 页对照](reports/comparisons_20261117/README.md)替代。
+[当前完整报告](outputs/report_archive_20261117/reports/document_mesh_20261117.md)和[全部 60 页对照](outputs/report_archive_20261117/reports/comparisons_20261117/README.md)替代。
 
 ## 17. 多来源充分训练（2026-11-15 启动，2026-11-17 已完成）
 
@@ -654,7 +654,7 @@ tail -n 20 outputs/diverse_training_20261115/train.log
 ```
 
 训练后队列自动运行 DeepScores/Doc3D 验证保持检查及 CPMS 固定回归。训练未完成前不宣称真实照片效果改善，
-也不自动替换默认权重。完整来源、质量审计和配置见 [多来源训练报告](reports/diverse_training_20261115.md)。
+也不自动替换默认权重。完整来源、质量审计和配置见 [多来源训练报告](outputs/report_archive_20261117/reports/diverse_training_20261115.md)。
 
 目前 120/120 轮与既定回归均已完成。本轮网络的真实照片效果明显改善，但仍未追平传统 ABC；
 其权重没有被设为默认。后续文档方法改造见第 19 节。
@@ -756,7 +756,7 @@ CPMS 教师校直纹理不等于原始照片的人工几何真值。
 参考 [RDGR / Grid Regularization](https://openaccess.thecvf.com/content/CVPR2022/papers/Jiang_Revisiting_Document_Image_Dewarping_by_Grid_Regularization_CVPR_2022_paper.pdf)
 的显式行几何与平滑网格思想，以及 [UVDoc 官方模型](https://github.com/tanguymagne/UVDoc)。
 本项目的纵向残差网格不是论文复现，也不是完整的 3D/2D 联合训练。
-实测与局限见 [文档方案改造报告](reports/document_mesh_20261117.md)。
+实测与局限见 [文档方案改造报告](outputs/report_archive_20261117/reports/document_mesh_20261117.md)。
 60 页 CPMS 开发回归中，传统/结构网格平直度中位数为 0.158/0.123（58/60 页更直）；
 90 页带几何真值的合成回归中，五线谱平直度为 0.077/0.056，整体 AD 基本持平。
 新方案的边缘墨迹代理指标有部分退化，旧网络加网格后仍检出局部翻折，因此未切换默认。
@@ -765,8 +765,8 @@ CPMS 已暴露，属于开发回归；不能以谱线自评分替代新真实照
 
 ### 查看更多对照图
 
-[同位置局部放大图](reports/comparisons_20261117/README.md) ·
-[全部 60 页并排浏览器](reports/comparisons_20261117/index.html)（用浏览器打开本地 HTML）。
+[同位置局部放大图](outputs/report_archive_20261117/reports/comparisons_20261117/README.md) ·
+[全部 60 页并排浏览器](outputs/report_archive_20261117/reports/comparisons_20261117/index.html)（用浏览器打开本地 HTML）。
 可自由切换 7 个方案、整页/局部、缩放及同步滚动，也可记录逐页判断并导出 CSV。
 局部按谱线间距等比放大，不额外纠斜或拉伸；判断内容保留时需要同时检查整页。
 报告目录入口见 [reports/README.md](reports/README.md)。

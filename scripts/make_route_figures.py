@@ -14,8 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scoredewarp.core.metric_pipeline import dewarp_metric  # noqa: E402
 from scoredewarp.core.pipeline import dewarp  # noqa: E402
 
-DEV = ["dev/0001_re_staff_moderate", "dev/0012_re_jianpu_moderate", "dev/0003_re_mixed_mild",
-       "dev/0000_de_staff_moderate", "dev/0006_re_staff_severe"]
+DEV = ["dev/0012_re_jianpu_moderate", "dev/0000_de_staff_moderate", "dev/0006_re_staff_severe"]
 CPMS = ["IMG_1709", "IMG_1615", "IMG_1650"]
 
 

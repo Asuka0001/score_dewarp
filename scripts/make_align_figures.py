@@ -18,8 +18,7 @@ from scoredewarp.core.metric_pipeline import dewarp_metric, method_from_spec  # 
 from scoredewarp.core.preprocess import clean_page, paper_region  # noqa: E402
 
 OLD = "gcs:c.spacing_gate=0.2,c.ends_w=0.0,c.keep_scale=false,j.vseg_w=4.0,m.lam_u=3.0"  # 11-17 defaults
-DEV = ["dev/0012_re_jianpu_moderate", "dev/0062_re_jianpu_moderate", "dev/0087_re_jianpu_moderate",
-       "dev/0033_re_mixed_severe", "dev/0006_re_staff_severe"]
+DEV = ["dev/0062_re_jianpu_moderate", "dev/0033_re_mixed_severe"]
 
 
 def panel(im, label, height=1000, guides=True):
