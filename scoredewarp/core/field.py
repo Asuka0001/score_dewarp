@@ -101,7 +101,9 @@ def _sub(pts, d):
     return pts[keep]
 
 
-def build_constraints(S: Structures, grid, priors=("staff", "jianpu", "text", "vertical")):
+def build_constraints(S: Structures, grid, priors=("staff", "jianpu", "text", "vertical"), tuple_u=0.3, vseg_w=0.6):
+    """``tuple_u`` ties U of the 5 staff lines at one *current* image column, which
+    preserves whatever shear the current image has; 0 lets vertical strokes decide."""
     U, V = _System(grid), _System(grid)
     staves = S.staves if "staff" in priors else []
     s_all = [st.spacing for st in staves]
@@ -114,7 +116,8 @@ def build_constraints(S: Structures, grid, priors=("staff", "jianpu", "text", "v
         loc = np.diff(T[:, :, 1], axis=1).mean(1)          # local spacing per tuple
         for i in range(4):
             V.diff(T[:, i + 1], T[:, i], s_t, 1.0)
-            U.diff(T[:, i + 1], T[:, i], 0.0, 0.3)
+            if tuple_u > 0:
+                U.diff(T[:, i + 1], T[:, i], 0.0, tuple_u)
         xs_t = T[:, 0, 0]
         order = np.argsort(xs_t)
         for fi in st.frag_ids:
@@ -159,20 +162,23 @@ def build_constraints(S: Structures, grid, priors=("staff", "jianpu", "text", "v
         for v in S.vsegs:
             p = _sub(v.pts, 15)
             if len(p) >= 2:
-                U.diff(p[1:], p[:-1], 0.0, 0.6)
+                U.diff(p[1:], p[:-1], 0.0, vseg_w)
     return U, V
 
 
-def fit_field(S: Structures, node=48, lam=6.0, mu=0.02, priors=("staff", "jianpu", "text", "vertical")):
+def fit_field(S: Structures, node=48, lam=6.0, mu=0.02, priors=("staff", "jianpu", "text", "vertical"),
+              tuple_u=0.3, vseg_w=0.6, lam_u=None, lam_v=None):
+    """``lam_u`` / ``lam_v`` override the smoothness per component: V is pinned by
+    many reliable staff lines, U only by short, noisier vertical strokes."""
     H, W = S.shape
     g = _Grid(W, H, node)
-    U, V = build_constraints(S, g, priors)
+    U, V = build_constraints(S, g, priors, tuple_u=tuple_u, vseg_w=vseg_w)
     if not U.A or not V.A:
         return None
     gx, gy = np.meshgrid(np.arange(g.nx) * node, np.arange(g.ny) * node)
     sm = g.smooth_ops()
-    u = U.solve(sm, lam, gx.ravel().astype(float), mu)
-    v = V.solve(sm, lam, gy.ravel().astype(float), mu)
+    u = U.solve(sm, lam if lam_u is None else lam_u, gx.ravel().astype(float), mu)
+    v = V.solve(sm, lam if lam_v is None else lam_v, gy.ravel().astype(float), mu)
     UV = np.stack([u, v], 1).reshape(g.ny, g.nx, 2)
     # recentre so that the content stays on the same canvas
     UV -= (UV - np.stack([gx, gy], -1)).reshape(-1, 2).mean(0)

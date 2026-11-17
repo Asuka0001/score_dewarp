@@ -19,7 +19,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from scoredewarp.core.pipeline import Config, dewarp, refine_dewarp, result_json
+from scoredewarp.core.pipeline import Config, dewarp, dewarp_document, refine_dewarp, result_json
 from scoredewarp.core.structures import draw_structures
 from scoredewarp.eval.geometry import (sample_geometry, geometry_metrics, map_points,
                                        network_points, paired_geometry_metrics, orientation_error_rate)
@@ -31,12 +31,15 @@ STRUCTURE_KEYS = ("coverage", "staff_straight", "staff_spacing_cv", "barline_til
                   "jp_height_cv", "jp_tilt_deg", "jp_dot_err", "jp_lyric_err", "jp_rowgap_cv")
 
 
-def measure(folder, net, size, width, save_dir=None, *, networks=None):
+def measure(folder, net, size, width, save_dir=None, *, networks=None, document=False, uvdoc_model=None):
     image, meta, points, target, valid = sample_geometry(folder)
     gt = json.loads((folder / "gt.json").read_text())
     networks = networks if networks is not None else {"network_only": (net, size)}
     rows, maps, predictions = [], {}, {}
-    for name in ("input", "traditional", *networks):
+    names = ['input', 'traditional'] + (['document'] if document else []) + list(networks)
+    if uvdoc_model is not None:
+        names += ['uvdoc', 'uvdoc_mesh']
+    for name in names:
         row = {"sample": folder.name, "kind": meta["kind"], "method": name,
                "profile": meta.get("profile", "unspecified")}
         start = time.perf_counter()
@@ -49,6 +52,13 @@ def measure(folder, net, size, width, save_dir=None, *, networks=None):
             else:
                 if name == "traditional":
                     result = dewarp(image, Config(coarse_width=width))
+                elif name == 'document':
+                    result = dewarp_document(image, Config(coarse_width=width))
+                elif name in ('uvdoc', 'uvdoc_mesh'):
+                    from scoredewarp.learn import uvdoc
+                    bm, _, _ = uvdoc.predict(uvdoc_model, image,
+                                            out_size=(width, round(width * image.shape[0] / image.shape[1])))
+                    result = refine_dewarp(image, bm, Config(use_field=False, use_line_mesh=name == 'uvdoc_mesh'))
                 else:
                     model, model_size = networks[name]
                     bm, _, raw = predict(model, image, model_size, out_size=(width, round(width * 2263 / 1600)))
@@ -90,7 +100,7 @@ def measure(folder, net, size, width, save_dir=None, *, networks=None):
         rows.append(row)
     # Only compare the two actual correction methods. The original photo is
     # reported separately, so it cannot change their common support.
-    names = ("traditional", *networks)
+    names = [n for n in names if n != 'input']
     if all(name in maps for name in names):
         paired = paired_geometry_metrics(target, {name: predictions[name] for name in names}, valid)
         def common_valid(p):
@@ -124,7 +134,7 @@ def median(rows, key, section=None):
 
 def report(rows, out):
     lines = ["# 素材评测：几何、共同有效点、乐谱结构与检测质量", "",
-             "traditional = A+B+C；其余校正方法为网络反演后的实际输出映射，不加 C。",
+             "traditional = A+B+C；document = 原图坐标系 ABC + 谱线网格；uvdoc = 官方网格模型；uvdoc_mesh 另加谱线网格。其余为本地网络原始输出。",
              "校正方法均检查画布边界与 2px 往返误差；common 列使用所有校正方法的有效点交集。",
              "结构误差由真值关键点计算，非检测器自评分；DeepScores 无结构真值，相关项留空。",
              "误差与覆盖率列取逐页中位数；谱种正确率取均值。谱表检测按实例一对一匹配汇总。",
@@ -206,25 +216,42 @@ def report(rows, out):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--data', type=Path, action='append', required=True)
-    ap.add_argument('--checkpoint', type=Path, action='append', required=True,
+    ap.add_argument('--checkpoint', type=Path, action='append', default=[],
                     help='repeat to compare models; multi-model names use checkpoint parent directory names')
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--limit', type=int, default=0, help='per dataset, sorted by sample name')
     ap.add_argument('--save-images', action='store_true')
     ap.add_argument('--width', type=int, default=1600)
+    ap.add_argument('--document', action='store_true', help='include whole-canvas B + bounded line mesh')
+    ap.add_argument('--uvdoc-root', type=Path, help='include verified official UVDoc, with/without line mesh')
+    ap.add_argument('--per-kind-limit', type=int, default=0,
+                    help='select this many evenly spaced filenames per kind, independently of results')
     args = ap.parse_args()
     if args.out.exists() and any(args.out.iterdir()):
         ap.error('Use a new empty output directory')
     args.out.mkdir(parents=True, exist_ok=True)
     cv2.setNumThreads(1)
     names = ['network_only'] if len(args.checkpoint) == 1 else [p.parent.name for p in args.checkpoint]
-    if len(set(names)) != len(names) or set(names) & {'input', 'traditional'}:
+    if len(set(names)) != len(names) or set(names) & {'input', 'traditional', 'document', 'uvdoc', 'uvdoc_mesh'}:
         ap.error('Checkpoint parent directory names must be distinct and not input/traditional')
     networks = {name: load(path) for name, path in zip(names, args.checkpoint)}
+    uvdoc_model = None
+    if args.uvdoc_root:
+        from scoredewarp.learn import uvdoc
+        uvdoc_model = uvdoc.load(args.uvdoc_root)
+    if args.per_kind_limit < 0:
+        ap.error('--per-kind-limit must be nonnegative')
     config = {key: str(value) if isinstance(value, Path) else value for key,value in vars(args).items()}
     config['data'] = [str(p.resolve()) for p in args.data]
     config['checkpoint'] = {name: {'path': str(path.resolve()), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
                             for name, path in zip(names, args.checkpoint)}
+    config['source_sha256'] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in
+                               [Path(__file__), Path('scoredewarp/core/pipeline.py'),
+                                Path('scoredewarp/core/line_mesh.py'), Path('scoredewarp/core/transforms.py')]}
+    snapshot = args.out/'source_snapshot'
+    snapshot.mkdir()
+    for p in config['source_sha256']:
+        (snapshot/str(p).replace('/', '__')).write_bytes(Path(p).read_bytes())
     # Include code diff because checks are often run before committing a fix.
     config['git_head'] = subprocess.run(['git','rev-parse','HEAD'],capture_output=True,text=True).stdout.strip()
     diff = subprocess.run(['git','diff'],capture_output=True,text=True).stdout
@@ -233,6 +260,13 @@ def main():
     rows = []
     for dataset in args.data:
         folders = sorted(p for p in dataset.iterdir() if (p / 'gt.json').exists())
+        if args.per_kind_limit:
+            groups = {}
+            for folder in folders:
+                kind = json.loads((folder/'gt.json').read_text())['meta']['kind']
+                groups.setdefault(kind, []).append(folder)
+            folders = sorted(p for group in groups.values() for p in
+                             [group[i] for i in np.linspace(0, len(group)-1, min(len(group), args.per_kind_limit)).astype(int)])
         if args.limit:
             folders = folders[:args.limit]
         if not folders:
@@ -240,7 +274,8 @@ def main():
         label = str(dataset)
         for i, folder in enumerate(folders):
             dest = args.out / dataset.parent.name / dataset.name / folder.name if args.save_images else None
-            sample_rows = measure(folder, None, None, args.width, dest, networks=networks)
+            sample_rows = measure(folder, None, None, args.width, dest, networks=networks,
+                                  document=args.document, uvdoc_model=uvdoc_model)
             for row in sample_rows:
                 row['dataset'] = label
             rows.extend(sample_rows)

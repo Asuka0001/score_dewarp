@@ -7,60 +7,53 @@ Writes per input:
     <name>_debug.jpg       detected structures on the rectified image
     <name>_result.json     page type, regions, staff lines, jianpu rows, timings
     <name>_bmap.npy        backward map (output grid stride 4 -> input pixels)
+
+Methods
+    metric       (default) page homography -> camera + developable page surface
+                 fitted to staff lines / jianpu rows / vertical strokes -> residual field
+    traditional  legacy A+B+C (polynomial surface), kept for comparison only
 """
 import argparse
 import json
 import os
 import sys
-import time
 
 import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from scoredewarp.core.pipeline import Config, dewarp, refine_dewarp, result_json  # noqa: E402
+from scoredewarp.core.metric_pipeline import MetricConfig, dewarp_metric  # noqa: E402
+from scoredewarp.core.pipeline import Config, dewarp, result_json  # noqa: E402
 from scoredewarp.core.structures import draw_structures  # noqa: E402
+from scoredewarp.core.transforms import mapping_quality  # noqa: E402
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("inputs", nargs="+")
     ap.add_argument("--out", default="outputs/run")
-    ap.add_argument("--no-quad", action="store_true", help="skip page-boundary homography")
-    ap.add_argument("--no-surface", action="store_true")
-    ap.add_argument("--no-field", action="store_true")
-    ap.add_argument("--rot90", action="store_true", help="also test 90-degree page rotation")
-    ap.add_argument("--checkpoint", help="learned initialization followed by C refinement; skips A/B")
-    ap.add_argument("--network-only", action="store_true", help="with --checkpoint, skip C refinement")
+    ap.add_argument("--method", choices=("metric", "traditional"), default="metric")
+    ap.add_argument("--no-field", action="store_true", help="skip the residual field after the surface fit")
+    ap.add_argument("--crop-content", action="store_true",
+                    help="metric: output only the detected content box instead of the whole page")
     args = ap.parse_args()
-    if args.network_only and not args.checkpoint:
-        ap.error("--network-only requires --checkpoint")
     os.makedirs(args.out, exist_ok=True)
-    cfg = Config(use_page_quad=not args.no_quad, use_surface=not args.no_surface, use_field=not args.no_field,
-                 test_rot90=args.rot90)
-    if args.checkpoint:
-        from scoredewarp.learn.infer import load, predict, apply_kind_decision
-        net, size = load(args.checkpoint)
-        cfg.use_field = not (args.no_field or args.network_only)
     for path in args.inputs:
         img = cv2.imread(path)
         if img is None:
             print("cannot read", path)
             continue
         name = os.path.splitext(os.path.basename(path))[0]
-        if os.path.basename(path) == "photo.jpg":  # synthetic folders
+        if os.path.basename(path) == "photo.jpg":  # benchmark / synthetic folders
             name = os.path.basename(os.path.dirname(os.path.abspath(path)))
-        if args.checkpoint:
-            start = time.perf_counter()
-            bm, _, raw = predict(net, img, size, out_size=(1600, 2263))
-            network_time = time.perf_counter() - start
-            res = refine_dewarp(img, bm, cfg)
-            apply_kind_decision(res, net, raw)
-            res.timings["network_init"] = network_time
-            res.timings["total"] += network_time
-            res.stages["checkpoint"] = os.path.abspath(args.checkpoint)
+        if args.method == "metric":
+            cfg = MetricConfig(residual="none" if args.no_field else MetricConfig.residual,
+                               full_page=not args.crop_content)
+            res = dewarp_metric(img, cfg)
         else:
-            res = dewarp(img, cfg)
+            res = dewarp(img, Config(use_field=not args.no_field))
+        res.stages["method"] = args.method
+        res.stages["mapping_quality"] = mapping_quality(res.bmap, (img.shape[1], img.shape[0]))
         base = os.path.join(args.out, name)
         cv2.imwrite(base + "_rectified.png", res.image)
         cv2.imwrite(base + "_enhanced.png", res.enhanced)

@@ -129,3 +129,36 @@ def rotation_homography(angle_deg, size, rot90=False):
     T = np.array([[1, 0, -x0], [0, 1, -y0], [0, 0, 1]])
     nw, nh = int(np.ceil(rc[0].max() - x0)), int(np.ceil(rc[1].max() - y0))
     return T @ R @ M, (nw, nh)
+
+
+def page_mask(img: np.ndarray):
+    """Full-resolution mask of the paper (largest bright, low-saturation region).
+
+    Same segmentation as ``detect_page_quad`` but without the quadrilateral
+    requirement, so curled pages with curved borders keep their outline.
+    Returns None when the region is implausible (tiny, or the whole frame).
+    """
+    H, W = img.shape[:2]
+    sc = 800 / max(H, W)
+    small = cv2.resize(img, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(small, cv2.COLOR_BGR2LAB)
+    score = cv2.GaussianBlur(lab[..., 0].astype(np.float32) - 0.6 * hsv[..., 1].astype(np.float32), (0, 0), 3)
+    score = cv2.normalize(score, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, m = cv2.threshold(score, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    k = max(5, int(0.02 * max(small.shape[:2])))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((k, k), np.uint8))
+    n, lab_, stats, _ = cv2.connectedComponentsWithStats(m)
+    if n < 2:
+        return None
+    i = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    area = stats[i, cv2.CC_STAT_AREA] / m.size
+    if area < 0.15 or area > 0.98:
+        return None
+    comp = (lab_ == i).astype(np.uint8) * 255
+    # fill holes (dark ink regions inside the page)
+    cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    comp = np.zeros_like(comp)
+    cv2.drawContours(comp, cnts, -1, 255, -1)
+    return cv2.resize(comp, (W, H), interpolation=cv2.INTER_NEAREST)

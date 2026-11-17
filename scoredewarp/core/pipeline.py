@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import cv2
 import numpy as np
@@ -33,6 +33,8 @@ class Config:
     test_rot90: bool = False
     field_node: int = 48
     field_iters: int = 2
+    use_line_mesh: bool = False
+    field_kw: dict = None
 
 
 @dataclass
@@ -49,11 +51,10 @@ class Result:
         return self.bmap.forward_points(pts)
 
 
-def _detect(img, *, robust=True):
+def _detect(img, *, robust=True, local_lines=False):
     norm = normalize_illumination(to_gray(img))
-    valid = (to_gray(img) > 0).astype(np.uint8) if img.ndim == 2 else None
     ink = binarize(norm)
-    return norm, ink, detect_structures(norm, ink, robust=robust)
+    return norm, ink, detect_structures(norm, ink, robust=robust, local_lines=local_lines)
 
 
 def _filter_structures(S: Structures, priors):
@@ -129,29 +130,94 @@ def dewarp(img: np.ndarray, cfg: Config | None = None, verbose=False) -> Result:
     return _finish(img, cur, bm, cfg, stages, T, t0, verbose)
 
 
-def refine_dewarp(img: np.ndarray, initial_map: BackwardMap, cfg: Config | None = None,
-                  verbose=False) -> Result:
-    """Refine an existing learned rectification with stage C, then detect output.
+def dewarp_document(img: np.ndarray, cfg: Config | None = None, verbose=False) -> Result:
+    """Structure-first correction: original-frame ABC -> bounded staff mesh.
 
-    A/B are skipped: the nonlinear learned map cannot initialize B's homography
-    interface. All residual maps compose back to the original photo, so each
-    candidate output is sampled directly from the original pixels.
+    Preserve B's camera coordinate frame and extent: its full-image affine
+    extrapolation is only suitable for already nearly rectified inputs.
+    Keep C's horizontal-scale / vertical-stroke constraints as well. For
+    jianpu/mixed/uncertain coarse evidence retain the existing joint solution.
     """
     cfg = cfg or Config()
     t0 = time.time()
-    cur = initial_map.apply(img, value=255)
-    return _finish(img, cur, initial_map, cfg, {"initialization": "network", "surface_skipped": True},
-                   {}, t0, verbose)
+    result = dewarp(img, replace(cfg, use_line_mesh=False), verbose=False)
+    coarse_kind = result.stages.get('structures_coarse', {}).get('page_type', result.page_type)
+    if cfg.use_field and coarse_kind == 'staff' and result.page_type == 'staff':
+        result = _finish(img, result.image, result.bmap, replace(cfg, use_field=False, use_line_mesh=True),
+                         result.stages, result.timings, t0, verbose)
+    else:
+        result.stages['line_mesh'] = {'accepted': False, 'staff_systems': 0,
+                                     'reason': 'retain joint solution for nonstaff/uncertain evidence or disabled refinement'}
+    result.stages['initialization'] = 'structure_document'
+    return result
 
 
-def _finish(img, cur, bm, cfg, stages, T, t0, verbose):
+def refine_dewarp(img: np.ndarray, initial_map: BackwardMap, cfg: Config | None = None,
+                  verbose=False, surface=False) -> Result:
+    """Refine an existing learned rectification with optional B and C, then detect output.
+
+    A is skipped. With ``surface=True``, B is fitted on the learned output image
+    treated as a new photo (identity homography); its map is composed after the
+    learned one and keeps the learned output's whole canvas rather than B's
+    content-derived crop. ``cfg.use_surface`` is ignored here so existing
+    callers keep their behaviour. All residual maps compose back to the
+    original photo, so each candidate output is sampled from original pixels.
+    """
+    cfg = cfg or Config()
+    t0 = time.time()
+    T = {}
+    bm = initial_map
+    cur = bm.apply(img, value=255)
+    stages = {"initialization": "network", "surface_skipped": not surface}
+    if surface:
+        t = time.time()
+        _, _, S1 = _detect(cur, robust=False)
+        S1f = _filter_structures(S1, cfg.surface_priors)
+        h, w = cur.shape[:2]
+        sm = SurfaceModel((w, h))
+        n = sm.build(S1f, np.eye(3))
+        stages["surface_observations"] = int(n)
+        if n >= 20:
+            sm.fit()
+            stages["surface_rms_px"] = [sm.rms0, sm.rms]
+            bm2 = sm.backward_map(out_scale=1.0, extent=sm.image_extent((w, h)))
+            W2, H2 = bm2.out_size
+            if 0.7 < W2 / w < 1.4 and 0.7 < H2 / h < 1.4 and np.isfinite(bm2.grid).all():
+                bm = bm.compose(bm2)
+                cur = bm.apply(img, value=255)
+            else:
+                stages["surface_rejected"] = True
+        else:
+            stages["surface_rejected"] = True
+        T["surface"] = time.time() - t
+    return _finish(img, cur, bm, cfg, stages, T, t0, verbose)
+
+
+def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False):
+    # Absolute line-level constraints replace C for reliable staff systems.
+    # Each accepted residual is monotone and preserves its full input canvas.
+    mesh_info = None
+    if cfg.use_line_mesh:
+        from .line_mesh import fit_line_mesh
+        t = time.time()
+        _, _, evidence = _detect(cur, local_lines=local_lines)
+        if evidence.page_type in ('jianpu', 'mixed'):
+            residual, mesh_info = None, {'accepted': False, 'staff_systems': 0,
+                                        'reason': 'retain joint glyph/text constraints for jianpu/mixed'}
+        else:
+            residual, mesh_info = fit_line_mesh(evidence)
+        stages['line_mesh'] = mesh_info
+        if residual is not None:
+            bm = bm.compose(residual)
+            cur = bm.apply(img, value=255)
+        T['line_mesh'] = time.time() - t
     # ---- C: residual field ---------------------------------------------------
-    if cfg.use_field:
+    if cfg.use_field and (mesh_info is None or mesh_info['staff_systems'] == 0):
         t = time.time()
         for _ in range(cfg.field_iters):
-            _, _, S2 = _detect(cur, robust=False)
+            _, _, S2 = _detect(cur, robust=False, local_lines=local_lines)
             S2f = _filter_structures(S2, cfg.field_priors)
-            fb = fit_field(S2f, node=cfg.field_node, priors=cfg.field_priors)
+            fb = fit_field(S2f, node=cfg.field_node, priors=cfg.field_priors, **(cfg.field_kw or {}))
             if fb is None:
                 break
             bm = bm.compose(fb)

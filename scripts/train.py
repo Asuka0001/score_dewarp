@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scoredewarp.learn.dataset import SynthScoreDataset
 from scoredewarp.learn.model import ScoreDewarpNet, load_init_weights, losses
+from scoredewarp.learn.robust_geometry import ImprovementTracker
 
 
 def geometry_batch(batch, *, keep_instances=False):
@@ -156,6 +157,7 @@ def main():
               "torch_version": str(torch.__version__)}
     out_path.with_suffix(".config.json").write_text(json.dumps(config, indent=2))
     history, best, best_epoch, wait, step = [], float("inf"), 0, 0, 0
+    improvement_tracker = ImprovementTracker(args.min_delta)
     t0 = time.time()
     initial = validate(net, vl, dev, args.geometry_only, args.consistency_weight) if vl else {}
     history.append({"epoch": 0, "step": 0, "elapsed_s": time.time()-t0, **{"val_"+k:v for k,v in initial.items()}})
@@ -196,9 +198,8 @@ def main():
         score = metrics.get("coord_epe_pct", train_sum/count)
         if not np.isfinite(score):
             raise ValueError("Nonfinite validation score")
-        improved = score < best
-        significant = score < best - args.min_delta
-        wait = 0 if significant else wait + 1
+        improved = improvement_tracker.update(score)
+        wait = improvement_tracker.wait
         if improved:
             best, best_epoch = score, ep
         checkpoint = {"model": net.state_dict(), "arch": net.arch, "size": tuple(args.size), "epoch": ep, "step": step,

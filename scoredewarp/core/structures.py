@@ -488,18 +488,31 @@ def find_text_rows(ink, line_len, band, *, reject_boxes=True):
     return rows, h_mode
 
 
-def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True) -> Structures:
+def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_lines=False) -> Structures:
     """Detect exported structures; ``robust=False`` preserves optimizer evidence.
 
     Recovered faint/broken lines are useful for page type and annotations, but
     do not yet have calibrated confidence for driving B/C's deformation fit.
+    ``local_lines=True`` always also tries locally thresholded line evidence
+    and keeps whichever finds more staff lines (thin grey lines next to dark
+    noteheads are lost by global Otsu even when some staves survive).
     """
     H, W = ink.shape
     thick, sp = run_metrics(ink)
     frags_pts, hmask = find_fragments(ink, thick, sp if sp else 12, horizontal=True)
     frags = [Fragment(p) for p in frags_pts]
     staves = group_staves(frags, W, sp if sp else None, bridge_gaps=robust)
-    if robust and not staves:
+    if local_lines:
+        block = max(15, min(H, W) // 50) | 1
+        local_ink = cv2.adaptiveThreshold(norm, 1, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                          cv2.THRESH_BINARY_INV, block, 5)
+        local_thick, local_sp = run_metrics(local_ink)
+        local_frags = [Fragment(p) for p in find_fragments(local_ink, local_thick, local_sp or 12)[0]]
+        local_staves = group_staves(local_frags, W, local_sp or None, bridge_gaps=robust)
+        n_lines = lambda st: sum(len(s.frag_ids) for s in st)
+        if n_lines(local_staves) > 1.1 * n_lines(staves):
+            frags, staves, thick = local_frags, local_staves, local_thick
+    elif robust and not staves:
         # Global Otsu is dominated by dark noteheads. On blurred/downsampled
         # scores the thin grey staff lines can be brighter than its threshold,
         # so no grouping algorithm can recover them from `ink`. Use local

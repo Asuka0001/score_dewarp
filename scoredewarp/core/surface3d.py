@@ -235,15 +235,34 @@ class SurfaceModel:
         return res
 
     # ------------------------------------------------------------------
-    def backward_map(self, margin=0.05, stride=4, out_scale=1.0):
+    def image_extent(self, size):
+        """Page-unit box covering a whole input image instead of detected content.
+
+        Fits an affine map from observed image points to their fitted page
+        coordinates and transforms the image corners. Intended for inputs that
+        are already nearly rectified (e.g. a learned map's output), where the
+        affine approximation is accurate and nothing outside detected rows
+        should be cropped.
+        """
+        X, Y = self._XY(self.p)
+        A = np.concatenate([self.obs, np.ones((len(self.obs), 1))], 1)
+        coef, *_ = np.linalg.lstsq(A, np.stack([X, Y], 1), rcond=None)
+        W, H = size
+        corners = np.array([[0, 0, 1], [W, 0, 1], [0, H, 1], [W, H, 1]], float) @ coef
+        return (corners[:, 0].min(), corners[:, 0].max(), corners[:, 1].min(), corners[:, 1].max())
+
+    def backward_map(self, margin=0.05, stride=4, out_scale=1.0, extent=None):
         p = self.p
-        X, Y = self._XY(p)
-        # output extent from musical content (staves, rows), not page edges / clutter
-        X, Y = X[self.content], Y[self.content]
-        x0, x1 = np.percentile(X, [0.5, 99.5])
-        y0, y1 = np.percentile(Y, [0.5, 99.5])
-        mx = margin * (x1 - x0)
-        x0, x1, y0, y1 = x0 - mx, x1 + mx, y0 - mx, y1 + mx
+        if extent is not None:
+            x0, x1, y0, y1 = extent
+        else:
+            X, Y = self._XY(p)
+            # output extent from musical content (staves, rows), not page edges / clutter
+            X, Y = X[self.content], Y[self.content]
+            x0, x1 = np.percentile(X, [0.5, 99.5])
+            y0, y1 = np.percentile(Y, [0.5, 99.5])
+            mx = margin * (x1 - x0)
+            x0, x1, y0, y1 = x0 - mx, x1 + mx, y0 - mx, y1 + mx
         # arc-length reparameterisation on a fine grid
         n = 300
         Xg, Yg = np.meshgrid(np.linspace(x0, x1, n), np.linspace(y0, y1, n))

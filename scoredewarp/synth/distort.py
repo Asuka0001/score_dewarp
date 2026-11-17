@@ -24,7 +24,9 @@ def _rot(rx, ry, rz):
 
 
 class PageWarp:
-    def __init__(self, page_wh, out_wh, rng, strength=1.0):
+    def __init__(self, page_wh, out_wh, rng, strength=1.0, fill_range=(.72, .93)):
+        if len(fill_range) != 2 or not 0 < fill_range[0] <= fill_range[1] <= 2:
+            raise ValueError('fill_range must be increasing in (0,2]')
         Wf, Hf = page_wh
         self.Wf, self.Hf = Wf, Hf
         self.W, self.H = out_wh
@@ -58,7 +60,7 @@ class PageWarp:
         self.c = np.array([self.W / 2, self.H / 2])
         self.D = 1.5
         self._center = np.array([self._x3[-1] / 2, self.aspect / 2, np.mean(self._z3)])
-        fill = rng.uniform(0.72, 0.93)
+        fill = rng.uniform(*fill_range)
         for _ in range(4):
             p = self._project_norm(self._outline())
             span = np.maximum(p.max(0) - p.min(0), 1e-6)
@@ -67,7 +69,7 @@ class PageWarp:
         p = self._project_norm(self._outline())
         lo, hi = p.min(0), p.max(0)
         free = np.array([self.W, self.H]) - (hi - lo)
-        off = np.array([rng.uniform(0.2, 0.8), rng.uniform(0.2, 0.8)]) * np.maximum(free, 0)
+        off = np.array([rng.uniform(0.2, 0.8), rng.uniform(0.2, 0.8)]) * (free if fill > 1 else np.maximum(free, 0))
         self.shift = off - lo
 
     def _outline(self):
@@ -137,10 +139,10 @@ def _background(rng, H, W):
 
 def simulate_photo(flat: np.ndarray, ann: list[dict], rng: np.random.Generator, out_wh=(1200, 1600),
                    strength=1.0, degrade=True, *, shadow_probability=0.6, blur_sigma=None,
-                   require_invertible=False):
+                   require_invertible=False, fill_range=(.72, .93)):
     Hf, Wf = flat.shape[:2]
     W, H = out_wh
-    pw = PageWarp((Wf, Hf), out_wh, rng, strength)
+    pw = PageWarp((Wf, Hf), out_wh, rng, strength, fill_range)
     projection = None
     if require_invertible:
         for attempt in range(64):
@@ -148,7 +150,7 @@ def simulate_photo(flat: np.ndarray, ann: list[dict], rng: np.random.Generator, 
             if projection["valid"]:
                 projection["rejected_candidates"] = attempt
                 break
-            pw = PageWarp((Wf, Hf), out_wh, rng, strength)
+            pw = PageWarp((Wf, Hf), out_wh, rng, strength, fill_range)
         else:
             raise ValueError("Cannot generate a nonfolding projection after 64 attempts")
 

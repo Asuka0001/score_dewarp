@@ -80,3 +80,33 @@ class BackwardMap:
             self._inv = LinearNDInterpolator(src[ok], out[ok])
         pts = np.asarray(pts, float).reshape(-1, 2)
         return self._inv(pts)
+
+
+def mapping_quality(bmap, photo_size):
+    """Check all four bilinear Jacobian corners in finite, in-photo cells.
+
+    Includes the second triangle missed by a top-left-only determinant test.
+    This is a local check, not proof of global injectivity or correct geometry.
+    Singular values report stretching; they are not forced to unity because
+    perspective and output resolution legitimately change the local scale.
+    """
+    p = np.asarray(bmap.grid, float)
+    a, b, c, d = p[:-1, :-1], p[:-1, 1:], p[1:, :-1], p[1:, 1:]
+    valid = np.ones(a.shape[:2], bool)
+    for corner in (a, b, c, d):
+        valid &= np.isfinite(corner).all(-1)
+        valid &= (corner >= 0).all(-1) & (corner <= np.asarray(photo_size) - 1).all(-1)
+    derivatives = [(b-a, c-a), (b-a, d-b), (d-c, c-a), (d-c, d-b)]
+    count = int(valid.sum())
+    if not count:
+        return {'checked_cells': 0, 'folded_cell_fraction': None, 'safe_local_orientation': False}
+    jac = np.stack([np.stack([dx[valid], dy[valid]], -1) / bmap.stride for dx, dy in derivatives])
+    determinant = np.linalg.det(jac)
+    singular = np.linalg.svd(jac, compute_uv=False)
+    folds = (determinant <= 0).any(0)
+    return {'checked_cells': count, 'folded_cell_fraction': float(folds.mean()),
+            'safe_local_orientation': not bool(folds.any()),
+            'jacobian_min': float(determinant.min()),
+            'local_scale_p01': float(np.quantile(singular[..., 1], .01)),
+            'local_scale_p99': float(np.quantile(singular[..., 0], .99)),
+            'anisotropy_p99': float(np.quantile(singular[..., 0] / np.maximum(singular[..., 1], 1e-8), .99))}

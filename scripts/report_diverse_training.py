@@ -1,0 +1,79 @@
+"""Summarize data provenance, live training status and eventual fixed evaluation."""
+import argparse
+from datetime import datetime,timedelta,timezone
+import json
+from pathlib import Path
+
+
+def read(path):return json.loads(path.read_text()) if path.exists() else None
+
+
+def main():
+    ap=argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--experiment',type=Path,default=Path('outputs/diverse_training_20261115'))
+    ap.add_argument('--out',type=Path,default=Path('reports/diverse_training_20261115.md'))
+    args=ap.parse_args();exp=args.experiment
+    audit=read(exp/'audit.json');state=read(exp/'status.json') or {};model=read(exp/'model/status.json') or {}
+    config=read(exp/'model/config.json') or {};history=read(exp/'model/history.json') or []
+    cache=read(Path('data/prepared/diverse_cache_clean_20261115/complete.json'))
+    lines=['# 多来源充分训练与数据审计（2026-11-15）','',
+           f"当前队列状态：**{state.get('status','not_started')}**；训练阶段：**{model.get('phase','not_started')}**。",
+           '', '## 检查发现与数据选择','',
+           '- 既有全量微调使用 2,810 张 DeepScores 合成照片，对应 1,405 个源页面、291 个曲谱分组；后续三谱种微调只回放其中 100 张。Doc3D 的 1,683 张 train 在几何预训练后没有继续混合保持。',
+           '- 本轮使用全部符合质量检查的 full_v3 train、Doc3D train、结构基准 v2 train，并从源页面增加轻形变/恒等/贴边视图；不把 pilot 重复页、结构 v1、旧评测/debug 页当作额外训练数据。',
+           '- CPMS 官方 training 有 663 张谱行、84 个来源编号。其中 1 张缺少语义文件，先排除；其余 662 张经过五线谱检测、纵向曲线/线距校直和复检，593 张通过、69 张未通过。它们与 full-photo/test 来源编号不重叠；相同音符序列连接的来源先合组，再按来源组划分训练/验证。',
+           '- CPMS 谱行只用作教师校直后的纹理。拼页前消除各裁图独立光照，避免拼接出人工阴影条带，再用已知形变生成密集配对监督；这不是 CPMS 原生稠密真值，也没有使用已评测的 60 张测试照片训练。',
+           '- 新增六档：恒等映射、轻形变、贴边裁切、常规形变、阴影、模糊。新物理形变先做投影方向检查，映射保存 float32。既有数据不覆盖；缓存额外以 stride-4 粗网格拒绝非正 Jacobian 占比超过 0.1% 的样本。',
+           '- 数据准备首版 CPMS 拼页的局部光照接缝在训练前检查时发现，已单独重生成干净版。首版与修正版均留存溯源，正式训练仅使用 clean 缓存。','']
+    if cache:
+        lines+=['| 来源 | 训练样本 | 验证样本 | 每次抽样目标比例 |','|---|---:|---:|---:|']
+        weights={'deepscores':35,'doc3d':15,'synthetic':30,'cpms_texture':20}
+        for family in weights:
+            lines.append(f"| {family} | {cache['family_counts']['train'][family]} | {cache['family_counts']['val'][family]} | {weights[family]}% |")
+        lines+=['',f"合计 train/val：**{cache['counts']['train']}/{cache['counts']['val']}**；质量筛除 {len(cache['rejected'])} 个样本。来源组跨集合重叠为 0。抽样比例按四类来源平衡，不等于文件数比例。每轮重新抽样并生成裁切与光照，累计实际见过的训练记录数写入状态/历史。",'']
+    lines+=['## 训练配置与验证','',
+            '- 主任务是几何校正：坐标 L1、梯度匹配、页掩码、页边界加权、结构一致性，以及 1/4 两尺度防折叠损失。原有辅助头的准入元数据失效，所有新权重均标为未准入，不自动替换默认输出。',
+            '- 原训练器早停改为独立的累计改善参照，避免小幅改善更新 best 后无法累计。本轮本身完全关闭早停，固定跑满 120 轮。',
+            '- Apple MPS、batch=8、输入 384×512、AdamW、LR=2e-4，两轮 warmup 后余弦衰减到 1%。每轮抽样数量等于训练记录数。',
+            '- 验证先按来源/谱种/条件汇总，再对四个来源等权；选模分数为平均坐标 EPE% + 0.5×边界 EPE% + 100×折叠比例。初始、第 1 轮、每个偶数轮及最后一轮完整验证。',
+            '- 保存 best、每轮 last、每 20 轮里程碑、优化器/调度器/RNG/已见样本计数和源码快照；支持按相同配置从完整 epoch 断点恢复。CPMS 测试集只在训练全部完成后运行固定回归，不参与选模。','']
+    if model:
+        updated=model.get('updated_at')
+        if updated:updated=datetime.fromisoformat(updated).astimezone(timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S +08:00')
+        lines += [f"当前 epoch：**{model.get('epoch',0)}/{model.get('planned_epochs',120)}**；step：**{model.get('step',0)}**。",
+                  f"更新于 `{updated or 'unknown'}`；设备 `{model.get('device','unknown')}`。",'']
+    if history:
+        latest=next((r for r in reversed(history) if 'validation' in r),history[-1])
+        if 'validation' in latest:
+            lines+=[f"最近完整验证：epoch **{latest['epoch']}**（0 表示初始权重；不是最终泛化成绩）。",'',
+                    '| 来源 | EPE% | 边界 EPE% | GT 页点覆盖率% | 折叠比例% |','|---|---:|---:|---:|---:|']
+            for family,v in latest['validation']['families'].items():
+                lines.append(f"| {family} | {v['coord_epe_pct']:.3f} | {v['edge_epe_pct']:.3f} | {v['coverage']*100:.3f} | {v['fold_rate']*100:.3f} |")
+            lines+=['']
+    cpms=read(exp/'cpms/evaluation.json')
+    if cpms:
+        lines+=['## 训练后的 CPMS 固定回归','',
+                '这是已暴露真实照片上的回归诊断：冻结输入检测谱线，共同有效点比较，不是人工 GT 或 OMR 准确率。','',
+                '| 方法 | own 源谱线点覆盖率% | common 平直度 | 比原图改善页数 |','|---|---:|---:|---:|']
+        for method,v in cpms['summary'].items():
+            improvement=cpms['paired_vs_input'].get(method,{})
+            straight=v['common']['staff_straight'];coverage=v['own']['point_coverage']
+            lines.append(f"| {method} | {coverage*100:.3f} | {straight:.3f} | {improvement.get('improved_pages','—')} |")
+        lines+=['']
+    else:lines+=['**训练尚未完成，不能宣称新模型已改善 CPMS 或达到真实照片可用水平。**','']
+    lines+=['## 查看与恢复','',
+            '```bash',
+            'cat outputs/diverse_training_20261115/model/status.json',
+            'tail -n 20 outputs/diverse_training_20261115/train.log',
+            '.venv/bin/python scripts/report_diverse_training.py',
+            '# 断点恢复（需要硬件可用的 MPS 环境，保持原配置不变）：',
+            '.venv/bin/python scripts/run_diverse_training.py --resume',
+            '```','',
+            '本轮数据：`data/prepared/diverse_clean_20261115/manifest.json`；正式缓存：`data/prepared/diverse_cache_clean_20261115/complete.json`。缓存复用未变化样本并校验其源图、标签、映射及缓存哈希；CPMS 重生成部分重新构建目标。',
+            '', '队列：120 轮训练 → DeepScores/Doc3D 原验证集检查 → CPMS 原始网络/新网络/传统方案固定对照 → 正向场诊断 → 更新报告。训练时间以实际速度估计；MPS 冒烟检查 batch=8 的稳定步耗时约 1 秒，完整任务预计需要约两天量级，尚不包含机器负载与暂停影响。',
+            '', '本轮完整单元/回归检查共 58 项通过，MPS batch=8 的训练梯度和内存冒烟检查通过。',
+            '', '## 新训练数据示例','', '![新训练数据](diverse_training_20261115.data.jpg)']
+    args.out.parent.mkdir(parents=True,exist_ok=True);args.out.write_text('\n'.join(lines)+'\n');print(args.out)
+
+
+if __name__=='__main__':main()

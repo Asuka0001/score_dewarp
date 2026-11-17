@@ -60,6 +60,48 @@ class HybridTests(unittest.TestCase):
         self.assertEqual(len(result.structures.staves), 1)
         np.testing.assert_array_equal(result.image, photo)
 
+    @staticmethod
+    def _bent_staff_page(curvature):
+        import cv2
+        h, w = 1400, 1200
+        photo = np.full((h, w, 3), 255, np.uint8)
+        cv2.putText(photo, "12", (80, 80), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 0), 4)
+        xs = np.arange(80, 1120)
+        for top in range(180, 1280, 180):
+            for i in range(5):
+                ys = top + 20 * i + curvature * (xs - 600) ** 2
+                pts = np.stack([xs, ys], 1).round().astype(np.int32)
+                cv2.polylines(photo, [pts], False, (0, 0, 0), 2)
+        # B uses the non-robust detector, which needs photo-like anti-aliased lines.
+        return cv2.GaussianBlur(photo, (3, 3), 0)
+
+    def test_surface_refinement_is_near_identity_on_flat_page_and_keeps_header(self):
+        photo = self._bent_staff_page(0.0)
+        initial = BackwardMap.from_homography(np.eye(3), (1200, 1400))
+        result = refine_dewarp(photo, initial, Config(use_field=False), surface=True)
+        self.assertFalse(result.stages.get("surface_rejected", False))
+        points = np.array([[100., 60.], [600., 700.], [1100., 1300.]])
+        # The header above the first staff stays on the canvas (no content crop).
+        np.testing.assert_allclose(result.bmap.forward_points(points), points, atol=3.)
+
+    def test_surface_refinement_reduces_mild_staff_bending(self):
+        from scoredewarp.core.pipeline import _detect
+        photo = self._bent_staff_page(0.00003)
+        initial = BackwardMap.from_homography(np.eye(3), (1200, 1400))
+        result = refine_dewarp(photo, initial, Config(use_field=False), surface=True)
+        self.assertFalse(result.stages.get("surface_rejected", False))
+        def bend(img):
+            staves = _detect(img)[2].staves
+            return np.median([np.ptp(np.asarray(s.tuples)[:, 0, 1]) / s.spacing for s in staves])
+        self.assertLess(bend(result.image), 0.7 * bend(photo))
+
+    def test_surface_refinement_without_structures_keeps_learned_map(self):
+        photo = np.full((80, 80, 3), 255, np.uint8)
+        initial = BackwardMap.from_homography(np.eye(3), (80, 80))
+        result = refine_dewarp(photo, initial, Config(use_field=False), surface=True)
+        self.assertIs(result.bmap, initial)
+        self.assertTrue(result.stages["surface_rejected"])
+
 
 if __name__ == "__main__":
     unittest.main()
