@@ -10,7 +10,7 @@
 
 v0.1 提供**以结构先验为核心的几何优化方案**，可以直接运行、不依赖训练数据；同时提供已完成几何预训练与乐谱微调的多任务网络，以及合成数据、辅助头训练和双域验证工具。
 
-> **当前主线（2026-11-17 起）**：只保留一条矫正管线。页面单应 + 纠斜 → 针孔相机 + 一般柱面（可展曲面）拟合 → 按方向平滑的残差场，见 `scoredewarp/core/metric_pipeline.py` 和 `gcs.py`。它是 `dewarp.py` 的默认方法。
+> **当前主线（2026-11-17 起）**：只保留一条矫正管线。页面单应 + 纠斜 → 针孔相机 + 一般柱面（可展曲面）拟合 → 按方向平滑的残差场，见 `scoredewarp/core/metric_pipeline.py` 和 `gcs.py`。它是 `dewarp.py` 的默认方法。 2026-11-18 起：输出范围由检测到的纸张边缘决定（GrabCut 纸张掩码 + 纸面 RANSAC 筛选），阅读副本去阴影、纸外置白，见报告"2026-11-18 补充"一节。
 > 评测改用 Doc3D 真实纸张形变重新贴图的乐谱基准（`data/bench/doc3d_score`，dev/test 各 120 页），指标全部来自真值。
 > 在测试集（只评一次）上，相比旧 ABC：内容区 AD 1.76 → 0.97，LD 13.1 → 7.0，谱线平直度 0.47 → 0.063，竖线倾角 3.4° → 1.7°，简谱基线 0.136 → 0.052，页面覆盖 0.90 → 0.998。
 > 网络 UV、UVDoc 和混合分支已从 CLI 移除，代码保留。详见 [主线报告](reports/metric_route_20261117.md)。下文第 2–19 节为历史记录。
@@ -24,7 +24,8 @@ cd score_dewarp
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # 校正自己的照片（默认：主线 metric 管线）
-.venv/bin/python scripts/dewarp.py my_score.jpg --out outputs/run
+# 输出 _rectified.png（彩色矫正图）、_enhanced.png（去阴影阅读副本）；--binary 另存黑白版
+.venv/bin/python scripts/dewarp.py my_score.jpg --out outputs/run --binary
 # 旧 ABC，仅作对照
 .venv/bin/python scripts/dewarp.py my_score.jpg --method traditional --out outputs/abc
 

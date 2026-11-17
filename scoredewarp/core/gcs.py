@@ -231,21 +231,27 @@ class GCSModel:
         A[k:k + n_pri, cols] = 1
         return A
 
-    def fit(self, lam_curv=40.0, lam_th=0.3, lam_sp=2.0, lam_h=1.0, max_nfev=200, phis=(0.0, np.pi / 2)):
+    def fit(self, lam_curv=40.0, lam_th=0.3, lam_sp=2.0, lam_h=1.0, max_nfev=200, phis=(0.0, np.pi / 2),
+            warm=False):
+        """``warm``: continue from ``self.p0`` as is (no ruling-direction restarts)."""
         self.lam_curv, self.lam_th, self.lam_sp, self.lam_h = lam_curv, lam_th, lam_sp, lam_h
+        self.fit_kw = dict(lam_curv=lam_curv, lam_th=lam_th, lam_sp=lam_sp, lam_h=lam_h, max_nfev=max_nfev)
         n = 2 * len(self.obs)
         r0 = self.residuals(self.p0)
         self.rms0 = float(np.sqrt(np.mean(r0[:n] ** 2)))
         best = None
         sp = self.sparsity()
         kw = dict(jac_sparsity=sp, method="trf", loss="soft_l1", f_scale=3.0, x_scale="jac")
-        for phi in phis:  # short runs per ruling direction, then finish the best
-            p0 = self.p0.copy()
-            p0[6] = phi
-            res = least_squares(self.residuals, p0, max_nfev=max(20, max_nfev // 5), **kw)
-            if best is None or res.cost < best.cost:
-                best = res
-        best = least_squares(self.residuals, best.x, max_nfev=max_nfev, **kw)
+        if warm:
+            best = least_squares(self.residuals, self.p0, max_nfev=max_nfev, **kw)
+        else:
+            for phi in phis:  # short runs per ruling direction, then finish the best
+                p0 = self.p0.copy()
+                p0[6] = phi
+                res = least_squares(self.residuals, p0, max_nfev=max(20, max_nfev // 5), **kw)
+                if best is None or res.cost < best.cost:
+                    best = res
+            best = least_squares(self.residuals, best.x, max_nfev=max_nfev, **kw)
         self.p = best.x
         self.rms = float(np.sqrt(np.mean(best.fun[:n] ** 2)))
         e = np.hypot(*best.fun[:n].reshape(-1, 2).T) / np.maximum(self.w, 1e-9)
@@ -253,6 +259,146 @@ class GCSModel:
         self.err_p90 = float(np.percentile(e, 90))
         self.cost = float(best.cost)
         return best
+
+    # ------------------------------------------------------------- edges --
+    def flat_coords(self, q, iters=6):
+        """Inverse projection: image points (N, 2) -> flat page (X, Y) on the fitted surface."""
+        p = self.p
+        x0, x1, y0, y1 = self.content_extent(0.0)
+        gx, gy = (x1 - x0), (y1 - y0)
+        Xg, Yg = np.meshgrid(np.linspace(x0 - gx, x1 + gx, 120), np.linspace(y0 - gy, y1 + gy, 150))
+        Xg, Yg = Xg.ravel(), Yg.ravel()
+        qg = self.project(p, Xg, Yg)
+        ok = np.isfinite(qg).all(1)
+        from scipy.spatial import cKDTree
+        _, j = cKDTree(qg[ok]).query(q)
+        X, Y = Xg[ok][j].copy(), Yg[ok][j].copy()
+        h = 1e-4
+        for _ in range(iters):  # Gauss-Newton on the 2x2 local Jacobian
+            f0 = self.project(p, X, Y)
+            fx = (self.project(p, X + h, Y) - f0) / h
+            fy = (self.project(p, X, Y + h) - f0) / h
+            r = q - f0
+            det = fx[:, 0] * fy[:, 1] - fx[:, 1] * fy[:, 0]
+            det = np.where(np.abs(det) > 1e-12, det, np.nan)
+            dX = (fy[:, 1] * r[:, 0] - fy[:, 0] * r[:, 1]) / det
+            dY = (-fx[:, 1] * r[:, 0] + fx[:, 0] * r[:, 1]) / det
+            X, Y = X + np.nan_to_num(dX), Y + np.nan_to_num(dY)
+        bad = ~np.isfinite(self.project(p, X, Y)).all(1)
+        X[bad], Y[bad] = np.nan, np.nan
+        return X, Y
+
+    @staticmethod
+    def _ransac_line(a, b, tol, iters=200, seed=0):
+        """Inliers of b = c0 + c1 * a (an edge is straight in the flat page)."""
+        rng = np.random.default_rng(seed)
+        n = len(a)
+        best = np.zeros(n, bool)
+        for _ in range(iters):
+            i, j = rng.choice(n, 2, replace=False)
+            if abs(a[j] - a[i]) < 1e-9:
+                continue
+            c1 = (b[j] - b[i]) / (a[j] - a[i])
+            if abs(c1) > 0.2:   # an edge is never far from its axis after A
+                continue
+            inl = np.abs(b - (b[i] + c1 * (a - a[i]))) < tol
+            if inl.sum() > best.sum():
+                best = inl
+        return best
+
+    def select_edges(self, edges_coarse, H_coarse, tol=0.006, min_span=0.25):
+        """Keep the edge points that are straight in the flat page (RANSAC).
+
+        The paper outline from a brightness mask follows cast shadows and
+        occluders; those stretches are curved in the flat page while the real
+        border is a straight line X or Y = const there. Needs a fitted model.
+        """
+        Hinv = np.linalg.inv(H_coarse)
+        x0, x1, y0, y1 = self.content_extent(0.0)
+        size = max(x1 - x0, y1 - y0)
+        OX, OY = self._XY(self.p)   # content structures lie on the sheet
+        OX, OY = OX[self.content], OY[self.content]
+        out, info = {}, {}
+        self.edge_flat = {}         # side -> flat X or Y of the border (current surface)
+        for side, pts in edges_coarse.items():
+            q = cv2.perspectiveTransform(np.asarray(pts, float).reshape(-1, 1, 2), Hinv).reshape(-1, 2)
+            X, Y = self.flat_coords(q)
+            ok = np.isfinite(X)
+            if ok.sum() < 10:
+                continue
+            a, b = (X, Y) if side in ("top", "bottom") else (Y, X)
+            inl = np.zeros(len(q), bool)
+            inl[ok] = self._ransac_line(a[ok], b[ok], tol * size)
+            span = np.ptp(a[inl]) if inl.sum() > 1 else 0.0
+            length = (x1 - x0) if side in ("top", "bottom") else (y1 - y0)
+            info[side] = (int(inl.sum()), len(q), float(span / max(length, 1e-9)))
+            if inl.sum() < 8 or span < min_span * length:
+                continue
+            # a border with structures beyond it is a shadow / light edge, not the sheet
+            e = np.median(b[inl])
+            beyond = {"top": OY < e - tol * size, "bottom": OY > e + tol * size,
+                      "left": OX < e - tol * size, "right": OX > e + tol * size}[side]
+            info[side] += (float(beyond.mean()),)
+            if beyond.mean() > 0.005:
+                continue
+            out[side] = np.asarray(pts, float)[inl]
+            self.edge_flat[side] = float(e)
+        self.edge_info = info
+        return out
+
+    def add_edges(self, edges_coarse, H_coarse, w=1.0, widen=True):
+        """Append page-border observations (top/bottom: Y = const, left/right: X = const)
+        to a fitted model and prepare a warm restart from the current solution."""
+        Hinv = np.linalg.inv(H_coarse)
+        P = list(self.p)
+        n_old = len(P)
+        obs, xa, ya = [], [], []
+        self.edge_par, self.edge_rows = {}, {}
+        for side, pts in edges_coarse.items():
+            q = cv2.perspectiveTransform(np.asarray(pts, float).reshape(-1, 1, 2), Hinv).reshape(-1, 2)
+            X, Y = self.flat_coords(q)
+            ok = np.isfinite(X)
+            q, X, Y = q[ok], X[ok], Y[ok]
+            if len(q) < 8:
+                continue
+            horiz = side in ("top", "bottom")
+            P.append(float(np.median(Y if horiz else X)))
+            ie = len(P) - 1
+            self.edge_par[side] = ie
+            r0 = len(self.obs) + len(obs)
+            for qi, Xi, Yi in zip(q, X, Y):
+                P.append(float(Xi if horiz else Yi))
+                obs.append(qi)
+                xa.append(len(P) - 1 if horiz else ie)
+                ya.append(ie if horiz else len(P) - 1)
+            self.edge_rows[side] = np.arange(r0, len(self.obs) + len(obs))
+        if not obs:
+            return 0
+        k = len(obs)
+        self.obs = np.concatenate([self.obs, np.array(obs)])
+        self.xa = np.concatenate([self.xa, xa])
+        self.ya = np.concatenate([self.ya, ya])
+        self.yb = np.concatenate([self.yb, np.zeros(k, int)])
+        self.cyb = np.concatenate([self.cyb, np.zeros(k)])
+        self.w = np.concatenate([self.w, np.full(k, w)])
+        self.content = np.concatenate([self.content, np.zeros(k, bool)])
+        # widen the slope knots to the borders (theta is constant beyond the old ones)
+        X, Y = self._XY(np.array(P))
+        rc = 1.02 * np.max(np.hypot(X - self.Xc, Y - self.Yc))
+        if widen and rc > self.knots[-1]:
+            new = np.linspace(-rc, rc, K_KNOTS)
+            P[7:7 + K_KNOTS] = list(np.interp(new, self.knots, self.p[7:7 + K_KNOTS]))
+            self.knots = new
+            self.R = max(self.R, 1.2 * rc)
+            self.sg = np.linspace(-self.R, self.R, TABLE)
+        self.p0 = np.array(P)
+        return k
+
+    def edge_errors(self):
+        """Median reprojection error (px) per page side after the fit."""
+        X, Y = self._XY(self.p)
+        e = np.hypot(*(self.project(self.p, X, Y) - self.obs).T)
+        return {side: float(np.nanmedian(e[r])) for side, r in getattr(self, "edge_rows", {}).items()}
 
     # ------------------------------------------------------------ output --
     def content_extent(self, margin=0.05):
@@ -263,9 +409,28 @@ class GCSModel:
         m = margin * (x1 - x0)
         return x0 - m, x1 + m, y0 - m, y1 + m
 
-    def page_extent(self, page_mask=None, grow=0.35, margin=0.01):
+    def page_extent(self, page_mask=None, grow=0.35, margin=0.01, edges=(), edge_margin=0.015):
         """Flat box of all page points visible in the photo (inside the page
-        mask when given), limited to the content box grown by ``grow``."""
+        mask when given), limited to the content box grown by ``grow``.
+
+        Sides listed in ``edges`` (fitted paper borders, see ``add_edges``) are
+        taken from the border itself instead, without the ``grow`` limit."""
+        box = self._visible_extent(page_mask, grow, margin)
+        if not edges:
+            return box
+        x0, x1, y0, y1 = box
+        m = edge_margin * (x1 - x0)
+        par = getattr(self, "edge_par", {})
+        val = {side: (self.p[par[side]] if side in par else self.edge_flat[side]) for side in edges}
+        x0 = val["left"] - m if "left" in val else x0
+        x1 = val["right"] + m if "right" in val else x1
+        y0 = val["top"] - m if "top" in val else y0
+        y1 = val["bottom"] + m if "bottom" in val else y1
+        if x1 <= x0 or y1 <= y0:
+            return box
+        return x0, x1, y0, y1
+
+    def _visible_extent(self, page_mask, grow, margin):
         x0, x1, y0, y1 = self.content_extent(0.0)
         gx, gy = (x1 - x0) * grow, (y1 - y0) * grow
         bx0, bx1, by0, by1 = x0 - gx, x1 + gx, y0 - gy, y1 + gy

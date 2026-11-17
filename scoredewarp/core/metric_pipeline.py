@@ -16,7 +16,8 @@ import cv2
 import numpy as np
 
 from .gcs import GCSModel
-from .page import detect_page_quad, estimate_skew, page_mask, quad_homography, rotation_homography
+from .page import (detect_page_quad, estimate_skew, page_edges, page_mask, quad_homography, refine_page_mask,
+                   rotation_homography)
 from .pipeline import Config, _detect, _finish
 from .preprocess import binarize, normalize_illumination, to_gray
 from .transforms import BackwardMap
@@ -38,6 +39,12 @@ class MetricConfig:
     local_lines: bool = True
     adaptive_scale: str = "staff"   # staff: upscale when detected staves are small | off
     full_page: bool = True
+    edges: bool = True               # use the paper borders (needs full_page)
+    edge_mode: str = "extent"        # extent: borders bound the output only | fit: also straight-line constraints
+    edge_w: float = 1.0
+    edge_tol: float = 0.006          # RANSAC tolerance, fraction of the content size
+    edge_max_err: float = 4.0        # px; a side fitted worse than this is not used for the extent
+    edge_widen: bool = True          # re-space the slope knots over the borders
     focal_scale: float = 1.0
     residual: str = "field"          # none | field | mesh
     field_iters: int = 3
@@ -104,6 +111,7 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
     bm = BackwardMap.from_homography(Hc, size)
     cur = I1
     stages["structures_coarse"] = S1.summary()
+    paper_src = None
     model = GCSModel((W0, H0), focal=cfg.focal_scale * max(W0, H0))
     n = model.build(S1, Hc, weights=cfg.weights)
     stages["surface_observations"] = int(n)
@@ -113,7 +121,37 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
         stages["surface_err_px"] = [model.err_median, model.err_p90]
         stages["ruling_deg"] = float(np.degrees(model.p[6]))
         mask = page_mask(img) if cfg.full_page else None
-        extent = model.page_extent(mask) if cfg.full_page else model.content_extent()
+        good = ()
+        # content structures (staves, rows) are surely on the sheet; free line
+        # fragments and strokes may be the paper border itself
+        on_sheet = model.obs[model.content]
+        if cfg.full_page and cfg.edges:
+            mask = refine_page_mask(img, mask, on_sheet)
+        if cfg.full_page and cfg.edges and mask is not None:
+            # the mask must hold the content, else it is a lit patch / shadow
+            # outline rather than the sheet
+            qi = np.round(on_sheet).astype(int)
+            okq = (qi[:, 0] >= 0) & (qi[:, 0] < W0) & (qi[:, 1] >= 0) & (qi[:, 1] < H0)
+            inside = np.zeros(len(qi), bool)
+            inside[okq] = mask[qi[okq, 1], qi[okq, 0]] > 0
+            stages["mask_holds_structures"] = float(inside.mean())
+            cand = page_edges(mask, Hc, img=img) if inside.mean() >= 0.97 else {}
+            sel = model.select_edges(cand, Hc, tol=cfg.edge_tol) if cand else {}
+            stages["edges_candidates"] = {k: len(v) for k, v in cand.items()}
+            stages["edges_ransac"] = getattr(model, "edge_info", {})
+            if sel and cfg.edge_mode == "extent":
+                good = tuple(sel)
+            elif sel and model.add_edges(sel, Hc, w=cfg.edge_w, widen=cfg.edge_widen):
+                model.fit(**{**model.fit_kw, "max_nfev": 100}, warm=True)
+                err = model.edge_errors()
+                stages["edges_err_px"] = err
+                good = tuple(k for k, e in err.items() if e < cfg.edge_max_err)
+                stages["surface_err_px"] = [model.err_median, model.err_p90]
+        stages["edges_used"] = list(good)
+        # sheet mask for the reading copy: only when it holds the content
+        if mask is not None and stages.get("mask_holds_structures", 0) >= 0.97:
+            paper_src = mask
+        extent = model.page_extent(mask, edges=good) if cfg.full_page else model.content_extent()
         bm2 = model.backward_map(extent)
         W2, H2 = bm2.out_size
         finite = np.isfinite(bm2.grid).all(-1).mean()
@@ -132,7 +170,10 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
         legacy = replace(legacy, use_field=True)  # field remains the fallback for non-staff pages
     if cfg.residual == "none":
         legacy = replace(legacy, use_field=False)
-    return _finish(img, cur, bm, legacy, stages, T, t0, verbose, local_lines=cfg.local_lines)
+    res = _finish(img, cur, bm, legacy, stages, T, t0, verbose, local_lines=cfg.local_lines)
+    if paper_src is not None:
+        res.paper = (res.bmap.apply(paper_src, interp=cv2.INTER_LINEAR, value=0) > 127).astype(np.uint8) * 255
+    return res
 
 
 BENCH_METHODS = {

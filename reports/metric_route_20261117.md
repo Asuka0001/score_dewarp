@@ -124,12 +124,53 @@
 
 ## 局限与下一步
 
-1. **输出范围上限**：检测到纸张掩码时，应允许扩展到整张纸，而不是"内容框 + 35%"，即 test/0115 的问题。这是测试之后才发现的，按规则未改，下次在 dev 上验证。
+1. **输出范围上限**：检测到纸张掩码时，应允许扩展到整张纸，而不是"内容框 + 35%"，即 test/0115 的问题。这是测试之后才发现的，按规则未改，下次在 dev 上验证。（2026-11-18 已处理，见下节。）
 2. **简谱行检测**：数字行在阴影和较强弯曲下会被切成多段，并误判为文字行，导致约束的字高混乱。简谱仍是最弱的一类，dev 上 AD_c 比五线谱高。可以用 DeepScores / 渲染器的真值训练一个小分割网络，代替手工的谱线和文字行检测；这是"学习只用在检测上"，不回到 UV 回归。
 3. **严重形变**：折角是锥面，母线不平行，单一柱面表达不了，现在靠残差场兜底。severe 档的 LD_c 仍约 10%。
 4. **页边锯齿与阴影**：纯外观问题，不影响几何。
 5. **速度**：每页约 10 秒，主要花在 B 的两个起点和 3 轮残差上，可以并行或降采样观测。
 6. **基准的局限**：Doc3D 是 448px 采集后上采样，细褶皱被平滑掉了；光照是从原文档图近似得到的。真实照片只做了抽查。
+
+## 2026-11-18 补充：纸张边缘与阅读副本
+
+只在 dev 上调整；test 未重新计分，只用 test/0115 目视确认了上面第 1 条的修复。
+
+### 纸张边缘
+
+做法：
+1. **纸张掩码**：先用亮度掩码，再用 GrabCut 细化。种子取"内容结构（谱表、简谱行、文字行）的凸包 = 一定是纸"、"亮度掩码 = 可能是纸"、"画面边缘带 = 可能是背景"。单一亮度阈值在强阴影和聚光下会丢掉暗的纸面：dev 上亮度掩码只有 32/120 页能包住 97% 以上的内容，GrabCut 之后绝大多数页都能做到。
+2. **候选边**：掩码轮廓按对角极值点分成上、下、左、右四段。去掉圆角、贴着画框的部分，以及颜色梯度弱的点（软阴影边界、掩码穿过平坦区域的地方）。
+3. **筛选**：先只用内容拟合曲面，把候选点映射到展平后的纸面，在纸面上做 RANSAC 直线拟合（真纸边在纸面上是 X 或 Y 为常数）。外侧还有内容结构的边丢弃（那是阴影或光斑的边）；掩码包不住 97% 内容时整页不用边。只用内容结构做这两项检查：自由的横线片段和竖线可能正是纸边本身（test/0115 就是这样）。
+4. **用途**：通过筛选的边决定输出范围（越过纸边留 1.5% 余量），不再受"内容框 + 35%"的限制。
+
+把纸边也作为曲面拟合的直线约束（`edge_mode=fit`）在 dev 上不划算：内容区 AD 约 50 页变好、70 页变差，权重降到 0.2 也一样。原因是 Doc3D 的纸在边缘处卷得最厉害，单一柱面要同时拉直内部和卷边，会把内部拉歪。所以默认只用来定范围（`edge_mode=extent`），几何与之前相同；页边仍有轻微波浪，不影响读谱。
+
+dev 结果（相对无纸边版本，几何差异是输出尺寸变化带来的噪声级波动）：
+
+| | 无纸边 | 默认（纸边定范围） |
+|---|---:|---:|
+| 内容区 AD 中位数 | 1.009 | 0.985 |
+| LD 均值 | 13.17 | 12.46 |
+| 页面覆盖 均值 | 0.983 | 0.988 |
+| 页面覆盖 最差页 | 0.517 | 0.638 |
+| 每页耗时 中位数 | 10.6 s | 10.9 s |
+
+![extent](metric_route_20261117/extent_test_0115.jpg)
+
+### 阅读副本（`_enhanced.png`，`--binary` 另存黑白版）
+
+- **去阴影**：背景用灰度闭运算估计，核略大于最粗的笔画（约 1.6 倍谱线间距），再做同尺寸中值滤波，然后原图除以背景。旧做法用大核最大值滤波加高斯模糊，会把锐利的投影边界抹开，留下一圈阴影轮廓；闭运算保留边界位置。
+- **对比度**：把淡墨拉暗、纸纹拉白；黑白版阈值取 Otsu 与白之间的一半，细而淡的谱线不至于断开。
+- **纸外置白**：用管线里的纸张掩码（GrabCut 细化后、且包得住内容时）映射到输出，取凸包并内缩 1%，把纸边那条暗线也置白；靠近纸边 8% 的带内（页边空白，没有内容），掩码外或大片很暗的区域也置白。
+
+![cleanup jianpu](metric_route_20261117/cleanup_dev_0012_jianpu_shadow.jpg)
+![cleanup spotlight](metric_route_20261117/cleanup_dev_0026_spotlight.jpg)
+![cleanup severe](metric_route_20261117/cleanup_dev_0006_staff_severe.jpg)
+![cleanup cpms](metric_route_20261117/cleanup_IMG_1650.jpg)
+
+已知不足：掩码漏进相邻的暗背景、且漏得比边缘带更深时（上面 0006 右侧的灰色桌面、0026 左侧的黑布），阅读副本里会留一块浅色噪点。内容本身不受影响。
+
+产物：`outputs/bench/dev_edges1..5`（`dev_edges5` 为最终默认）。
 
 ## 复现
 
@@ -141,7 +182,8 @@
 .venv/bin/python scripts/bench.py --data data/bench/doc3d_score/dev --methods "gcs:c.lam_v=0.3,w.vseg=3" --out outputs/bench/x
 .venv/bin/python scripts/bench_report.py outputs/bench/dev outputs/bench/x --methods abc metric "gcs:c.lam_v=0.3,w.vseg=3" --base abc
 .venv/bin/python scripts/make_route_figures.py --out reports/metric_route_20261117
-.venv/bin/python scripts/dewarp.py photo.jpg --out outputs/run            # 默认新主线
+.venv/bin/python scripts/dewarp.py photo.jpg --out outputs/run --binary   # 默认新主线，另存黑白阅读副本
+.venv/bin/python scripts/bench.py --data data/bench/doc3d_score/dev --methods metric "gcs:edges=false" "gcs:edge_mode=fit" --out outputs/bench/edges
 .venv/bin/python scripts/dewarp.py photo.jpg --method traditional --out outputs/abc
 ```
 

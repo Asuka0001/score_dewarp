@@ -46,6 +46,7 @@ class Result:
     page_type: str
     stages: dict = field(default_factory=dict)
     timings: dict = field(default_factory=dict)
+    paper: np.ndarray | None = None   # uint8 mask of the sheet on the output (metric pipeline)
 
     def forward_points(self, pts):
         return self.bmap.forward_points(pts)
