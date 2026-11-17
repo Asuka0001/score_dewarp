@@ -296,6 +296,7 @@ def refine_page_mask(img: np.ndarray, rough: np.ndarray | None, structure_pts: n
         return rough
     bgd, fgd = np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64)
     try:
+        cv2.setRNGSeed(0)   # GrabCut's GMM init is random: same photo, same sheet
         cv2.grabCut(small, gc, None, bgd, fgd, iters, cv2.GC_INIT_WITH_MASK)
     except cv2.error:
         return rough

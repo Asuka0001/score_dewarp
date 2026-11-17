@@ -59,8 +59,8 @@ def main():
         res.stages["mapping_quality"] = mapping_quality(res.bmap, (img.shape[1], img.shape[0]))
         base = os.path.join(args.out, name)
         cv2.imwrite(base + "_rectified.png", res.image)
-        paper = paper_region(res.paper, res.image)
         sp = getattr(res.structures, "spacing_est", None)
+        paper = paper_region(res.paper, res.image, spacing=sp)
         cv2.imwrite(base + "_enhanced.png", clean_page(res.image, paper, sp))
         if args.binary:
             cv2.imwrite(base + "_binary.png", clean_page(res.image, paper, sp, mode="binary"))

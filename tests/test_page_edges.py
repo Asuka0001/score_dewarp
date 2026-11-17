@@ -4,7 +4,8 @@ import cv2
 import numpy as np
 
 from scoredewarp.core.page import page_edges
-from scoredewarp.core.preprocess import clean_page
+from scoredewarp.core.preprocess import clean_page, protect_content
+from scoredewarp.core.structures import _merge_chains
 
 
 class PageEdgesTest(unittest.TestCase):
@@ -42,6 +43,42 @@ class CleanPageTest(unittest.TestCase):
         self.assertGreater(paper[:, 210:].mean(), 240)  # shadowed paper is white too
         self.assertLess(out[100:102, 300:440].mean(), 100)  # lines in the shadow stay dark
         self.assertLess(out[300, 250], 100)
+
+
+    def test_mask_never_cuts_content(self):
+        H, W = 600, 500
+        img = np.full((H, W, 3), 230, np.uint8)
+        for y in range(480, 530, 12):                # last staff, cut by the mask
+            img[y:y + 2, 40:460] = 30
+        for x in range(60, 440, 30):
+            cv2.circle(img, (x, 498), 6, (20, 20, 20), -1)
+        rng = np.random.default_rng(0)
+        speck = rng.random((H, 120)) < 0.02          # sparse cloth texture
+        img[:, 380:][speck[:, :120]] = 90
+        region = np.zeros((H, W), np.uint8)
+        region[:505, :380] = 255                     # sheet mask: misses the lower half of the staff
+        out = protect_content(region, img, spacing=12)
+        self.assertTrue((out[480:530, 60:370] > 0).all())     # whole staff kept
+        self.assertTrue((out[:400, 400:] == 0).mean() > 0.95)  # texture stays off-sheet
+
+
+class MergeRowsTest(unittest.TestCase):
+    def test_wide_gap_joined_lyrics_kept_apart(self):
+        h = 26.0
+        boxes = []
+        for x in [100, 140, 180]:                    # "5 4 4" left piece, a bit higher
+            boxes.append([x, 300 - 15, x + 16, 300 - 15 + h])
+        for x in range(420, 900, 40):                # rest of the row after "- - |"
+            boxes.append([x, 300, x + 16, 300 + h])
+        for x in range(100, 900, 40):                # lyric row 2.5 heights below
+            boxes.append([x, 300 + 2.5 * h, x + 24, 300 + 3.5 * h])
+        B = np.array(boxes, float)
+        n_left, n_right = 3, len(range(420, 900, 40))
+        chains = [list(range(n_left)), list(range(n_left, n_left + n_right)),
+                  list(range(n_left + n_right, len(B)))]
+        out = _merge_chains(chains, B)
+        self.assertEqual(len(out), 2)
+        self.assertEqual(sorted(len(c) for c in out), sorted([n_left + n_right, len(B) - n_left - n_right]))
 
 
 if __name__ == "__main__":

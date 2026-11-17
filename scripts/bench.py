@@ -12,10 +12,13 @@ through the method's photo->output map and aligned to their flat positions:
   ld      local distortion: error of neighbouring-point differences, % of the
           grid step (sensitive to local stretch / shear / wobble)
   cover   fraction of visible page points present in the output
-Structure (from flat labels mapped through the method):
+Structure (from flat labels mapped through the method, then through the
+whole-page alignment above, so a global squeeze of the page cannot lower tilts):
   straight   staff-line y std / spacing      spacing_cv  staff spacing CV
   vtilt      barline + stem angle from vertical (deg)
   jp_base    jianpu baseline std / digit height, jp_hcv, jp_tilt
+  bar_jp, bar_jp_sd   jianpu barline tilt / per-page spread (parallelism)
+  lalign     staves' left ends (clefs) max horizontal misalignment, in spacings
 
   python scripts/bench.py --data data/bench/doc3d_score/dev --methods abc ab --out outputs/bench/dev
 """
@@ -79,33 +82,40 @@ def get_method(name):
 
 
 # ---------------------------------------------------------------- metrics ----
-def _align(pred, target, aniso):
-    """Return pred aligned to target (rotation [+ per-axis scale] + translation)."""
+def _align(pred, target, aniso, return_fn=False):
+    """Return pred aligned to target (rotation [+ per-axis scale] + translation);
+    with ``return_fn`` also the fitted map, to apply to other output points."""
     s, R, t = _similarity_fit(pred, target)
     if not aniso:
-        return s * pred @ R.T + t
+        fn = lambda q: s * np.asarray(q, float) @ R.T + t  # noqa: E731
+        return (fn(pred), fn) if return_fn else fn(pred)
     th0 = np.arctan2(R[1, 0], R[0, 0])
 
-    def solve(th):
+    def solve(th, pts=None):
         c, s_ = np.cos(th), np.sin(th)
-        q = pred @ np.array([[c, -s_], [s_, c]]).T
-        out = np.empty_like(q)
+        rot = np.array([[c, -s_], [s_, c]])
+        q = pred @ rot.T
+        coefs = []
         for k in (0, 1):
             A = np.stack([q[:, k], np.ones(len(q))], 1)
             coef, *_ = np.linalg.lstsq(A, target[:, k], rcond=None)
-            out[:, k] = A @ coef
-        return out
+            coefs.append(coef)
+        qq = (pred if pts is None else np.asarray(pts, float)) @ rot.T
+        return np.stack([qq[:, k] * coefs[k][0] + coefs[k][1] for k in (0, 1)], 1)
 
     best = minimize_scalar(lambda th: ((solve(th) - target) ** 2).sum(), bounds=(th0 - 0.2, th0 + 0.2),
                            method="bounded", options={"xatol": 1e-5})
-    return solve(best.x)
+    fn = lambda q: solve(best.x, q)  # noqa: E731
+    return (fn(pred), fn) if return_fn else fn(pred)
 
 
-def _ad_ld(pred, target, keep, aniso):
+def _ad_ld(pred, target, keep, aniso, fn_out=None):
     if keep.sum() < 20:
         return {}
     aligned = np.full(pred.shape, np.nan)
-    aligned[keep] = _align(pred[keep], target[keep], aniso)
+    aligned[keep], fn = _align(pred[keep], target[keep], aniso, return_fn=True)
+    if fn_out is not None:
+        fn_out.append(fn)
     out = {"ad": float(np.sqrt(((aligned[keep] - target[keep]) ** 2).sum(-1).mean()) * 100)}
     err, ref = [], []
     for axis in (0, 1):
@@ -120,10 +130,11 @@ def _ad_ld(pred, target, keep, aniso):
     return out
 
 
-def geometry(points, target, valid, bmap, aniso, content=None):
+def geometry(points, target, valid, bmap, aniso, content=None, fn_out=None):
     """Whole visible page (ad, ld) and the printed-content box only (ad_c, ld_c):
     a method that crops the margins is not rewarded by dropping its worst points,
-    and content errors are not diluted by blank margins."""
+    and content errors are not diluted by blank margins. ``fn_out`` (list)
+    receives the whole-page alignment map output -> flat."""
     if bmap is None:
         pred, keep = points.astype(float), valid.copy()
     else:
@@ -131,7 +142,7 @@ def geometry(points, target, valid, bmap, aniso, content=None):
     keep &= valid
     n = int(valid.sum())
     out = {"cover": float(keep.sum() / max(n, 1))}
-    out.update(_ad_ld(pred, target, keep, aniso))
+    out.update(_ad_ld(pred, target, keep, aniso, fn_out))
     if content is not None:
         inc = valid & content
         out["cover_c"] = float((keep & inc).sum() / max(inc.sum(), 1))
@@ -149,11 +160,23 @@ def content_mask(gt, target):
     return (target[..., 0] >= lo[0]) & (target[..., 0] <= hi[0]) & (target[..., 1] >= lo[1]) & (target[..., 1] <= hi[1])
 
 
-def structure(gt, bmap):
+def structure(gt, bmap, align=None):
+    """Structure metrics, measured after ``align`` (the whole-page alignment of
+    ``geometry``) when given: on Doc3D re-textures the alignment fits X and Y
+    scale separately, so without it a method that squeezes the page sideways
+    would lower every tilt angle (and lalign) for free."""
     if bmap is None:
-        fwd, size = (lambda p: np.asarray(p, float)), None
+        raw, size = (lambda p: np.asarray(p, float)), None
     else:
-        fwd, size = bmap.forward_points, bmap.out_size
+        raw, size = bmap.forward_points, bmap.out_size
+
+    def fwd(p):
+        q = np.asarray(raw(np.asarray(p, float).reshape(-1, 2)), float)
+        if size is not None:
+            q[~((q >= 0).all(1) & (q < np.asarray(size)).all(1))] = np.nan
+        return q if align is None else align(q)
+
+    size = None
     m = evaluate(gt, fwd, out_size=size)
     out = {k: m[k] for k in ("staff_straight", "staff_spacing_cv", "jp_baseline", "jp_height_cv", "jp_tilt_deg")
            if k in m and m[k] is not None}
@@ -170,6 +193,62 @@ def structure(gt, bmap):
                 tilts.append(_ang_from_vertical(q[:1], q[1:])[0])
     if tilts:
         out["vtilt"] = float(np.mean(tilts))
+    out.update(alignment(gt, fwd, size))
+    return out
+
+
+def _fwd_ok(fwd, size, p):
+    q = np.asarray(fwd(np.asarray(p, float)), float)
+    if size is not None:
+        q[~((q >= 0).all(1) & (q < np.asarray(size)).all(1))] = np.nan
+    return q
+
+
+def alignment(gt, fwd, size):
+    """Parallelism and alignment that a reader sees directly:
+      bar_jp     mean |angle| of jianpu barlines from vertical (deg)
+      bar_jp_sd  per-page std of their signed angles: 0 = all barlines parallel
+      lalign     max horizontal misalignment of the staves' left ends (where the
+                 clefs sit), in staff spacings, after an affine fit to the flat
+                 positions (keeps genuine indentation of the first system)"""
+    out = {}
+    ang = []
+    for a in gt["photo_ann"]:
+        if a["kind"] == "barline" and a.get("region") == "jianpu":
+            p = np.asarray(a["pts"], float)[[0, -1]]
+            if not np.isfinite(p).all():
+                continue
+            q = _fwd_ok(fwd, size, p)
+            if np.isfinite(q).all():
+                d = q[1] - q[0]
+                d = d if d[1] >= 0 else -d
+                ang.append(np.degrees(np.arctan2(d[0], d[1])))
+    if len(ang) >= 3:
+        ang = np.array(ang)
+        out["bar_jp"] = float(np.abs(ang).mean())
+        out["bar_jp_sd"] = float(ang.std())
+    lines = {}
+    for af, ap in zip(gt["flat_ann"], gt["photo_ann"]):
+        if af["kind"] == "staff_line" and af.get("line") in (0, 4):
+            lines.setdefault(af["staff"], {})[af["line"]] = (np.asarray(af["pts"], float), np.asarray(ap["pts"], float))
+    F, O, S = [], [], []
+    for st in lines.values():
+        if 0 not in st or 4 not in st:
+            continue
+        (f0, p0), (f4, p4) = st[0], st[4]
+        if not (np.isfinite(p0[0]).all() and np.isfinite(p4[0]).all()):
+            continue
+        q = _fwd_ok(fwd, size, np.stack([p0[0], p4[0]]))
+        if not np.isfinite(q).all():
+            continue
+        F.append((f0[0] + f4[0]) / 2)
+        O.append(q.mean(0))
+        S.append(np.linalg.norm(q[1] - q[0]) / 4)
+    if len(F) >= 3:
+        F, O = np.array(F), np.array(O)
+        A = np.stack([F[:, 0], F[:, 1], np.ones(len(F))], 1)
+        coef, *_ = np.linalg.lstsq(A, O[:, 0], rcond=None)
+        out["lalign"] = float(np.abs(A @ coef - O[:, 0]).max() / np.median(S))
     return out
 
 
@@ -192,12 +271,15 @@ def run_one(args):
             res = None if fn is None else fn(image)
             bmap = None if res is None else res.bmap
             row["time"] = time.time() - t0
-            row.update(geometry(points, target, valid, bmap, aniso, content))
-            row.update(structure(gt, bmap))
+            fns = []
+            row.update(geometry(points, target, valid, bmap, aniso, content, fns))
+            row.update(structure(gt, bmap, fns[0] if fns else None))
             if res is not None:
                 row["out_size"] = list(bmap.out_size)
                 st = getattr(res, "stages", {}) or {}
-                row["notes"] = {k: st[k] for k in ("surface_rejected", "fallback", "model") if k in st}
+                row["notes"] = {k: st[k] for k in ("surface_rejected", "fallback", "model", "field_scale") if k in st}
+                if "field_scale" in st:   # aspect change by the residual field (invisible to ad: per-axis fit)
+                    row["field_aspect"] = st["field_scale"][0] / st["field_scale"][1]
                 if save_dir:
                     d = Path(save_dir) / folder.parent.name / folder.name
                     d.mkdir(parents=True, exist_ok=True)
@@ -211,7 +293,8 @@ def run_one(args):
 
 
 # ---------------------------------------------------------------- report -----
-KEYS = ["ad_c", "ld_c", "cover_c", "ad", "ld", "cover", "straight", "spacing_cv", "vtilt", "jp_base", "jp_hcv", "jp_tilt", "time"]
+KEYS = ["ad_c", "ld_c", "cover_c", "ad", "ld", "cover", "straight", "spacing_cv", "vtilt", "jp_base", "jp_hcv", "jp_tilt",
+        "bar_jp", "bar_jp_sd", "lalign", "time"]
 ALIAS = {"staff_straight": "straight", "staff_spacing_cv": "spacing_cv", "jp_baseline": "jp_base",
          "jp_height_cv": "jp_hcv", "jp_tilt_deg": "jp_tilt"}
 LOWER_BETTER = {k: not k.startswith("cover") for k in KEYS}
@@ -254,7 +337,7 @@ def summarize(rows, methods):
         for m in methods:
             if m == base:
                 continue
-            for k in ("ad_c", "ld_c", "cover_c", "ad", "straight", "vtilt", "jp_base"):
+            for k in ("ad_c", "ld_c", "cover_c", "ad", "straight", "vtilt", "jp_base", "jp_tilt", "bar_jp_sd", "lalign"):
                 d = []
                 for s in samples:
                     a, b = by.get((s, m), {}), by.get((s, base), {})

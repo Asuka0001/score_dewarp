@@ -48,6 +48,61 @@ def binarize(norm: np.ndarray, valid: np.ndarray | None = None) -> np.ndarray:
     return ink
 
 
+def _spacing_or_default(shape, spacing):
+    return float(spacing) if spacing and spacing > 0 else max(10.0, min(shape) / 120)
+
+
+def _flatten_shading(gray: np.ndarray, spacing: float | None) -> np.ndarray:
+    """gray / background (float32, 0..255); background = grey closing just wider
+    than the thickest strokes, then a median of the same size."""
+    H, W = gray.shape
+    sp = _spacing_or_default(gray.shape, spacing)
+    sc = min(1.0, 600 / min(H, W) if min(H, W) > 1200 else 1.0)
+    g = cv2.resize(gray, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA) if sc < 1 else gray
+    k = max(7, int(round(1.6 * sp * sc))) | 1
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    bg = cv2.morphologyEx(g, cv2.MORPH_CLOSE, ker)
+    bg = cv2.medianBlur(bg, min(k, 255))
+    if sc < 1:
+        bg = cv2.resize(bg, (W, H), interpolation=cv2.INTER_LINEAR)
+    norm = gray.astype(np.float32) / np.maximum(bg.astype(np.float32), 1) * 255
+    return np.clip(norm, 0, 255)
+
+
+def protect_content(region: np.ndarray, image: np.ndarray, spacing: float | None = None,
+                    min_inside: float = 0.25, min_density: float = 0.15) -> np.ndarray:
+    """Grow a sheet region so that it never cuts through printed content.
+
+    Ink (shading-flattened, so cast shadows are not ink) is dilated by about one
+    staff spacing into content blobs -- a staff with its clef and notes, a text
+    line. A blob lying at least ``min_inside`` within the region belongs to the
+    sheet and is added whole if it is dense like print: a sheet mask that cuts across the last system or
+    the clefs at the page edge (paper running out of the photo, a shadow
+    leaking into the mask) no longer erases music. Clutter beyond the sheet
+    stays outside: it lies mostly outside the region, and background texture
+    is too sparse.
+    """
+    gray = to_gray(image)
+    sp = _spacing_or_default(gray.shape, spacing)
+    ink = (_flatten_shading(gray, sp) < 150).astype(np.uint8)
+    ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    k = max(5, int(round(1.2 * sp))) | 1
+    blobs = cv2.dilate(ink, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(blobs, connectivity=8)
+    if n <= 1:
+        return region
+    area = np.maximum(stats[:, cv2.CC_STAT_AREA], 1).astype(float)
+    frac = np.bincount(lab[region > 0], minlength=n) / area
+    # printed content is dense (a dilated staff / text line is ~20-27 % ink);
+    # flattened background texture (cloth, wood) is sparse speckle (~4 %)
+    density = np.bincount(lab[ink > 0], minlength=n) / area
+    keep = (frac >= min_inside) & (density >= min_density)
+    keep[0] = False
+    out = region.copy()
+    out[keep[lab]] = 255
+    return out
+
+
 def clean_page(img: np.ndarray, paper: np.ndarray | None = None, spacing: float | None = None,
                mode: str = "gray") -> np.ndarray:
     """Reading copy of a rectified page: shading removed, paper white, ink dark.
@@ -61,18 +116,7 @@ def clean_page(img: np.ndarray, paper: np.ndarray | None = None, spacing: float 
     ``mode``: "gray" (contrast-stretched grey) or "binary" (Otsu on the result).
     """
     gray = to_gray(img)
-    H, W = gray.shape
-    sp = float(spacing) if spacing and spacing > 0 else max(10.0, min(H, W) / 120)
-    sc = min(1.0, 600 / min(H, W) if min(H, W) > 1200 else 1.0)
-    g = cv2.resize(gray, None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA) if sc < 1 else gray
-    k = max(7, int(round(1.6 * sp * sc))) | 1
-    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    bg = cv2.morphologyEx(g, cv2.MORPH_CLOSE, ker)
-    bg = cv2.medianBlur(bg, min(k, 255))
-    if sc < 1:
-        bg = cv2.resize(bg, (W, H), interpolation=cv2.INTER_LINEAR)
-    norm = gray.astype(np.float32) / np.maximum(bg.astype(np.float32), 1) * 255
-    norm = np.clip(norm, 0, 255)
+    norm = _flatten_shading(gray, spacing)
     on = paper > 0 if paper is not None else np.ones_like(gray, bool)
     vals = norm[on]
     if vals.size > 100:
@@ -91,14 +135,16 @@ def clean_page(img: np.ndarray, paper: np.ndarray | None = None, spacing: float 
 
 
 def paper_region(mask: np.ndarray | None, image: np.ndarray | None = None, band=0.08,
-                 dark=0.5) -> np.ndarray | None:
+                 dark=0.5, spacing: float | None = None, protect: bool = True) -> np.ndarray | None:
     """Sheet region on the output for ``clean_page``, from a warped paper mask.
 
     The convex hull fills dents (missed shadowed paper), shrunk a little so the
     dark paper edge is whitened. Background notches of a wavy border lie inside
     the hull; within a band along the border (page margin, no content) the mask
     itself, shrunk, decides, and with ``image`` large dark areas (a table the
-    mask leaked into; thin ink is blurred away) are dropped as well.
+    mask leaked into; thin ink is blurred away) are dropped as well. With
+    ``image`` the result is finally grown over content blobs it cuts through
+    (``protect_content``): whitening must never erase music.
     """
     if mask is None or mask.mean() / 255 < 0.15:
         return None
@@ -118,4 +164,7 @@ def paper_region(mask: np.ndarray | None, image: np.ndarray | None = None, band=
         g = cv2.GaussianBlur(to_gray(image).astype(np.float32), (0, 0), max(2.0, 0.01 * min(m.shape)))
         level = np.percentile(g[core > 0], 75)
         near &= g >= dark * level
-    return np.where((core > 0) | ((hull > 0) & near), 255, 0).astype(np.uint8)
+    region = np.where((core > 0) | ((hull > 0) & near), 255, 0).astype(np.uint8)
+    if image is not None and protect:
+        region = protect_content(region, image, spacing)
+    return region

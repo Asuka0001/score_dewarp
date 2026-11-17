@@ -29,7 +29,19 @@ from .transforms import BackwardMap
 # residual field is smoothed per component: V is pinned by many reliable staff
 # lines (soft), U only by short, noisier strokes (stiffer).
 DEFAULT_WEIGHTS = {"vseg": 5.0}
-DEFAULT_FIELD = {"tuple_u": 0.0, "vseg_w": 4.0, "lam_u": 3.0, "lam_v": 0.5}
+# 2026-11-18 (dev): every staff / jianpu row is pulled to the page's spacing /
+# digit height (spacing_gate 9: the old 20 % gate kept exactly the worst-fitted
+# staves as they were), the staves' left / right ends (clefs, final barlines)
+# share one U (ends_w). Per page type: jianpu barlines and upright character
+# strokes are reliable verticals (vseg_w 8 -- on staff pages short accidental /
+# beam fragments are not, and AD suffers); on mixed pages a softer U lets the
+# short jianpu barlines straighten (a softer U on jianpu pages costs AD).
+# keep_scale: the field must not change the page's global scale / aspect, which
+# the bench cannot see (its alignment fits X and Y scale separately); anchor:
+# nor slide content off the canvas.
+DEFAULT_FIELD = {"tuple_u": 0.0, "vseg_w": 4.0, "lam_u": 3.0, "lam_v": 0.5, "spacing_gate": 9.0, "ends_w": 2.0,
+                 "keep_scale": True, "anchor": True}
+DEFAULT_FIELD_TYPE = {"jianpu": {"vseg_w": 8.0}, "mixed": {"lam_u": 1.5}}   # on top of DEFAULT_FIELD
 
 
 @dataclass
@@ -37,6 +49,7 @@ class MetricConfig:
     coarse_width: int = 1600
     robust_detect: bool = False
     local_lines: bool = True
+    merge_rows: bool = False         # join jianpu / text row pieces split by wide gaps
     adaptive_scale: str = "staff"   # staff: upscale when detected staves are small | off
     full_page: bool = True
     edges: bool = True               # use the paper borders (needs full_page)
@@ -51,6 +64,7 @@ class MetricConfig:
     fit_kw: dict = None
     weights: dict = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
     field_kw: dict = field(default_factory=lambda: dict(DEFAULT_FIELD))
+    field_type: dict = field(default_factory=lambda: {k: dict(v) for k, v in DEFAULT_FIELD_TYPE.items()})
 
 
 def _coarse_homography(img, quad, width):
@@ -81,7 +95,7 @@ def detect_at_scale(img, Hc, size, I1, cfg, stages):
     ~12 px. Only measured staff spacing triggers this: other periodic ink
     (digit strokes) would upscale jianpu pages for nothing, which hurts them.
     """
-    _, _, S = _detect(I1, robust=cfg.robust_detect, local_lines=cfg.local_lines)
+    _, _, S = _detect(I1, robust=cfg.robust_detect, local_lines=cfg.local_lines, merge_rows=cfg.merge_rows)
     if cfg.adaptive_scale != "off" and S.staves:
         sp = float(np.median([st.spacing for st in S.staves]))
         if sp < 9:
@@ -89,7 +103,7 @@ def detect_at_scale(img, Hc, size, I1, cfg, stages):
             Hc = np.diag([f, f, 1.0]) @ Hc
             size = (int(round(size[0] * f)), int(round(size[1] * f)))
             I1 = cv2.warpPerspective(img, Hc, size, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            _, _, S = _detect(I1, robust=cfg.robust_detect, local_lines=cfg.local_lines)
+            _, _, S = _detect(I1, robust=cfg.robust_detect, local_lines=cfg.local_lines, merge_rows=cfg.merge_rows)
             stages["coarse_upscale"] = f
     return Hc, size, I1, S
 
@@ -165,12 +179,14 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
     T["surface"] = time.time() - t
 
     legacy = Config(use_field=cfg.residual == "field", use_line_mesh=cfg.residual == "mesh",
-                    field_iters=cfg.field_iters, field_kw=cfg.field_kw)
+                    field_iters=cfg.field_iters, field_kw=cfg.field_kw,
+                    field_kw_type=cfg.field_type)
     if cfg.residual == "mesh":
         legacy = replace(legacy, use_field=True)  # field remains the fallback for non-staff pages
     if cfg.residual == "none":
         legacy = replace(legacy, use_field=False)
-    res = _finish(img, cur, bm, legacy, stages, T, t0, verbose, local_lines=cfg.local_lines)
+    res = _finish(img, cur, bm, legacy, stages, T, t0, verbose, local_lines=cfg.local_lines,
+                  merge_rows=cfg.merge_rows)
     if paper_src is not None:
         res.paper = (res.bmap.apply(paper_src, interp=cv2.INTER_LINEAR, value=0) > 127).astype(np.uint8) * 255
     return res
@@ -185,9 +201,11 @@ BENCH_METHODS = {
 def method_from_spec(spec: str):
     """'gcs:residual=field,focal_scale=0.8,fit.lam_curv=20,c.lam_v=0.3,w.vseg=3' -> callable(img).
 
-    ``c.*`` / ``w.*`` override single entries of the tuned field / weight defaults."""
+    ``c.*`` / ``w.*`` override single entries of the tuned field / weight defaults,
+    ``j.*`` / ``m.*`` the field on jianpu / mixed pages only."""
     _, _, args = spec.partition(":")
-    kw, fit = {"field_kw": dict(DEFAULT_FIELD), "weights": dict(DEFAULT_WEIGHTS)}, {}
+    kw, fit = {"field_kw": dict(DEFAULT_FIELD), "weights": dict(DEFAULT_WEIGHTS),
+               "field_type": {k: dict(v) for k, v in DEFAULT_FIELD_TYPE.items()}}, {}
     for item in filter(None, args.split(",")):
         k, v = item.split("=")
         try:
@@ -200,6 +218,10 @@ def method_from_spec(spec: str):
             kw["field_kw"][k[2:]] = v
         elif k.startswith("w."):
             kw["weights"][k[2:]] = v
+        elif k.startswith("j."):
+            kw["field_type"]["jianpu"][k[2:]] = v
+        elif k.startswith("m."):
+            kw["field_type"]["mixed"][k[2:]] = v
         else:
             kw[k] = v
     if "field_iters" in kw:

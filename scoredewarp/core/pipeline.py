@@ -35,6 +35,7 @@ class Config:
     field_iters: int = 2
     use_line_mesh: bool = False
     field_kw: dict = None
+    field_kw_type: dict = None     # page_type -> field_kw overrides (e.g. stiffer verticals on jianpu)
 
 
 @dataclass
@@ -52,10 +53,10 @@ class Result:
         return self.bmap.forward_points(pts)
 
 
-def _detect(img, *, robust=True, local_lines=False):
+def _detect(img, *, robust=True, local_lines=False, merge_rows=False):
     norm = normalize_illumination(to_gray(img))
     ink = binarize(norm)
-    return norm, ink, detect_structures(norm, ink, robust=robust, local_lines=local_lines)
+    return norm, ink, detect_structures(norm, ink, robust=robust, local_lines=local_lines, merge_rows=merge_rows)
 
 
 def _filter_structures(S: Structures, priors):
@@ -194,14 +195,14 @@ def refine_dewarp(img: np.ndarray, initial_map: BackwardMap, cfg: Config | None 
     return _finish(img, cur, bm, cfg, stages, T, t0, verbose)
 
 
-def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False):
+def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_rows=False):
     # Absolute line-level constraints replace C for reliable staff systems.
     # Each accepted residual is monotone and preserves its full input canvas.
     mesh_info = None
     if cfg.use_line_mesh:
         from .line_mesh import fit_line_mesh
         t = time.time()
-        _, _, evidence = _detect(cur, local_lines=local_lines)
+        _, _, evidence = _detect(cur, local_lines=local_lines, merge_rows=merge_rows)
         if evidence.page_type in ('jianpu', 'mixed'):
             residual, mesh_info = None, {'accepted': False, 'staff_systems': 0,
                                         'reason': 'retain joint glyph/text constraints for jianpu/mixed'}
@@ -216,18 +217,21 @@ def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False):
     if cfg.use_field and (mesh_info is None or mesh_info['staff_systems'] == 0):
         t = time.time()
         for _ in range(cfg.field_iters):
-            _, _, S2 = _detect(cur, robust=False, local_lines=local_lines)
+            _, _, S2 = _detect(cur, robust=False, local_lines=local_lines, merge_rows=merge_rows)
             S2f = _filter_structures(S2, cfg.field_priors)
-            fb = fit_field(S2f, node=cfg.field_node, priors=cfg.field_priors, **(cfg.field_kw or {}))
+            kw = {**(cfg.field_kw or {}), **((cfg.field_kw_type or {}).get(S2.page_type, {}))}
+            fb = fit_field(S2f, node=cfg.field_node, priors=cfg.field_priors, **kw)
             if fb is None:
                 break
+            sc = stages.setdefault("field_scale", [1.0, 1.0])   # product over iterations
+            stages["field_scale"] = [sc[0] * fb.field_scale[0], sc[1] * fb.field_scale[1]]
             bm = bm.compose(fb)
             cur = bm.apply(img, value=255)
         T["field"] = time.time() - t
 
     # ---- D: outputs ------------------------------------------------------------
     t = time.time()
-    norm, ink, Sf = _detect(cur)
+    norm, ink, Sf = _detect(cur, merge_rows=merge_rows)
     enhanced = norm
     T["final_detect"] = time.time() - t
     T["total"] = time.time() - t0

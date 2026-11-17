@@ -423,7 +423,67 @@ def staff_band_mask(shape, staves, margin_sp=2.6):
     return m
 
 
-def find_text_rows(ink, line_len, band, *, reject_boxes=True):
+def _merge_chains(chains, B, max_gap=10.0, max_dy=0.9, max_ratio=1.6):
+    """Join row pieces split by wide gaps (jianpu "5 - - |", rests, lyrics with
+    blanks), dots or underlines: the longer piece's centre line, extrapolated
+    to the other piece, must hit it within ``max_dy`` glyph heights (adjacent
+    lyric rows are ~2.5 heights away), with similar glyph heights and a gap
+    below ``max_gap`` heights. Greedy, best pair first.
+    Like assembling text spans into lines (page_dewarp; Kim et al. 2015)."""
+    cx = (B[:, 0] + B[:, 2]) / 2
+    cy = (B[:, 1] + B[:, 3]) / 2
+    hh = B[:, 3] - B[:, 1]
+    chains = [sorted(c, key=lambda k: cx[k]) for c in chains]
+
+    def line(c):
+        h = float(np.median(hh[c]))
+        if len(c) >= 4 and np.ptp(cx[c]) > 3 * h:
+            # fit on the middle half of heights: dots / ascenders do not tilt it
+            m = np.abs(hh[c] - h) <= 0.25 * h
+            idx = np.array(c)[m] if m.sum() >= 3 else np.array(c)
+            k, b = np.polyfit(cx[idx], cy[idx], 1)
+            if abs(k) < 0.15:
+                return k, b, h
+        return 0.0, float(np.median(cy[c])), h
+
+    info = [line(c) for c in chains]
+    while len(chains) > 1:
+        k = np.array([i[0] for i in info])
+        b0 = np.array([i[1] for i in info])
+        h1 = np.array([i[2] for i in info])
+        n = np.array([len(c) for c in chains])
+        last = np.array([c[-1] for c in chains])
+        first = np.array([c[0] for c in chains])
+        # a (rows) left of b (columns)
+        H = np.maximum(h1[:, None], h1[None, :])
+        ok = H <= max_ratio * np.minimum(h1[:, None], h1[None, :])
+        gap = B[first, 0][None, :] - B[last, 2][:, None]
+        xa, xb = cx[last][:, None], cx[first][None, :]
+        ok &= (gap >= -0.3 * H) & (gap <= max_gap * H) & (xb > xa)
+        np.fill_diagonal(ok, False)
+        if not ok.any():
+            break
+        # both centre lines must agree at the junction
+        d1 = np.abs(k[:, None] * xb + b0[:, None] - cy[first][None, :]) * (n[:, None] >= 2)
+        d2 = np.abs(k[None, :] * xa + b0[None, :] - cy[last][:, None]) * (n[None, :] >= 2)
+        d3 = np.abs(cy[last][:, None] - cy[first][None, :])
+        # the longer piece's centre line is the reliable one; short pieces
+        # (< 4 glyphs) carry no direction, so they are judged by that line only
+        na, nb = n[:, None], n[None, :]
+        dy = np.where(na >= nb, d1, d2)
+        dy = np.where(np.maximum(na, nb) >= 4, dy, d3)
+        ok &= dy <= max_dy * H
+        if not ok.any():
+            break
+        score = np.where(ok, dy / H + 0.02 * gap / H, np.inf)
+        a, b = np.unravel_index(np.argmin(score), score.shape)
+        chains[a] = chains[a] + chains[b]
+        info[a] = line(chains[a])
+        del chains[b], info[b]
+    return chains
+
+
+def find_text_rows(ink, line_len, band, *, reject_boxes=True, merge_rows=False):
     # remove only pixels belonging to long, strictly horizontal runs (underlines,
     # 减时线, ledger/staff remnants) without eroding the glyphs touching them
     lines = directional_open(ink, line_len, True, angles=(-2, 0, 2), thicken=False)
@@ -464,13 +524,18 @@ def find_text_rows(ink, line_len, band, *, reject_boxes=True):
     left = np.where(np.isfinite(dist.min(0)), dist.argmin(0), -1)
     nxt = {i: int(right[i]) for i in range(len(blobs)) if right[i] >= 0 and left[right[i]] == i}
     has_prev = set(nxt.values())
-    rows = []
+    chains = []
     for i in range(len(blobs)):
         if i in has_prev:
             continue
         chain = [i]
         while chain[-1] in nxt:
             chain.append(nxt[chain[-1]])
+        chains.append(chain)
+    if merge_rows:
+        chains = _merge_chains(chains, B)
+    rows = []
+    for chain in chains:
         if len(chain) < 3:
             continue
         rb = [blobs[k] for k in chain]
@@ -488,7 +553,8 @@ def find_text_rows(ink, line_len, band, *, reject_boxes=True):
     return rows, h_mode
 
 
-def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_lines=False) -> Structures:
+def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_lines=False,
+                      merge_rows=False) -> Structures:
     """Detect exported structures; ``robust=False`` preserves optimizer evidence.
 
     Recovered faint/broken lines are useful for page type and annotations, but
@@ -496,6 +562,8 @@ def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_l
     ``local_lines=True`` always also tries locally thresholded line evidence
     and keeps whichever finds more staff lines (thin grey lines next to dark
     noteheads are lost by global Otsu even when some staves survive).
+    ``merge_rows=True`` joins jianpu / text row pieces split by wide gaps
+    (``_merge_chains``) before rows are classified.
     """
     H, W = ink.shape
     thick, sp = run_metrics(ink)
@@ -531,7 +599,7 @@ def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_l
         sp = float(np.median([s.spacing for s in staves]))
     band = staff_band_mask(ink.shape, staves)
     rows, h_mode = find_text_rows(ink, int(max(25, 3 * (sp or 12))), band,
-                                 reject_boxes=robust)
+                                 reject_boxes=robust, merge_rows=merge_rows)
     jp_rows = [r for r in rows if r.kind == "jianpu"]
     cands = []
     if staves:
