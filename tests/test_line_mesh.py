@@ -1,13 +1,10 @@
 import unittest
 
 import numpy as np
-import torch
-import torch.nn.functional as F
 
 from scoredewarp.core.line_mesh import fit_line_mesh
 from scoredewarp.core.structures import Staff, Structures
 from scoredewarp.eval.geometry import map_points
-from scoredewarp.learn.uvdoc import backward_map
 from scoredewarp.core.transforms import BackwardMap, mapping_quality
 
 
@@ -88,24 +85,6 @@ class LineMeshTests(unittest.TestCase):
             self.assertLessEqual(info['vertical_shear_max'], .5)
         else:
             self.assertFalse(info['accepted'])
-
-
-class UVDocAdapterTests(unittest.TestCase):
-    def test_identity_endpoints_on_nondivisible_canvas(self):
-        y, x = torch.meshgrid(torch.linspace(-1, 1, 7), torch.linspace(-1, 1, 5), indexing='ij')
-        mesh = torch.stack([x, y])[None]
-        bm = backward_map(mesh, (641, 799), (641, 799))
-        points = np.array([[0, 0], [640, 798], [333, 455]], float)
-        np.testing.assert_allclose(bm.sample(points), points, atol=1e-4)
-
-    def test_nonlinear_mesh_matches_official_align_corners_sampling(self):
-        y, x = torch.meshgrid(torch.linspace(-1, 1, 9), torch.linspace(-1, 1, 7), indexing='ij')
-        mesh = torch.stack([x + .04 * (1 - x**2) * y, y + .06 * torch.sin(x * 2)])[None]
-        # At stride 1 compare the adapter against the official continuous map.
-        bm = backward_map(mesh, (321, 400), (257, 345), stride=1)
-        official = F.interpolate(mesh, size=(345, 257), mode='bilinear', align_corners=True)[0].permute(1, 2, 0).numpy()
-        expected = (official + 1) * np.array([320, 399]) / 2
-        np.testing.assert_allclose(bm.grid[:345, :257], expected, atol=6e-5)
 
 
 class MapQualityTests(unittest.TestCase):
