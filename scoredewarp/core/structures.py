@@ -608,8 +608,64 @@ def refine_strokes(segs, ink, min_span, tol=1.0, step=3):
     return out
 
 
+def scale_structures(S: Structures, s: float) -> Structures:
+    """Structures detected on one canvas, expressed on a canvas scaled by ``s``."""
+    import copy
+    T = copy.deepcopy(S)
+    T.shape = (int(round(S.shape[0] * s)), int(round(S.shape[1] * s)))
+    T.thickness, T.spacing_est = S.thickness * s, S.spacing_est * s
+    for f in T.fragments:
+        f.pts = f.pts * s
+    for v in T.vsegs:
+        v.pts = v.pts * s
+    for st in T.staves:
+        st.tuples = [t * s for t in st.tuples]
+        st.spacing *= s
+        st.x_range = (st.x_range[0] * s, st.x_range[1] * s)
+        for name in ("top_poly", "bot_poly"):
+            c = getattr(st, name)
+            if c is not None:   # y' = s * f(x' / s): coefficient of x^k times s^(1-k)
+                n = len(c) - 1
+                setattr(st, name, np.array([ci * s ** (1 - (n - j)) for j, ci in enumerate(c)]))
+    for r in T.rows:
+        r.height *= s
+        for b in r.blobs:
+            b.x0, b.y0, b.x1, b.y1 = b.x0 * s, b.y0 * s, b.x1 * s, b.y1 * s
+    T.regions = [(t, np.asarray(p, float) * s) for t, p in S.regions]
+    return T
+
+
+def _learned_staves(seg, ink, thick, W, robust):
+    """Staves from the network's staff-line mask (``learned.masks``).
+
+    Returns (fragments, staves) or None when the mask holds no staff, so that
+    jianpu / text pages keep the classical path unchanged. Horizontal lines
+    outside the staff bands (jianpu 减时线, text underlines) still come from
+    ``ink``; inside the bands they would be ledger lines / beams."""
+    m = seg.get("staff")
+    if m is None or m.sum() < 5e-4 * m.size:
+        return None
+    s_thick, s_sp = run_metrics(m)
+    if not s_sp:
+        return None
+    sfr = [Fragment(p) for p in find_fragments(m, s_thick, s_sp)[0]]
+    staves = group_staves(sfr, W, s_sp, bridge_gaps=robust)
+    if not staves:
+        return None
+    sp = float(np.median([s.spacing for s in staves]))
+    band = staff_band_mask(ink.shape, staves)
+    # mask pieces outside any staff are mostly false positives (paper texture,
+    # print-through): keep their slots (indices) but drop their evidence
+    sfr = [f if f.staff >= 0 else Fragment(f.pts[:1]) for f in sfr]
+    for p in find_fragments(ink, thick, sp)[0]:
+        q = np.round(p[len(p) // 2]).astype(int)
+        if not band[np.clip(q[1], 0, band.shape[0] - 1), np.clip(q[0], 0, band.shape[1] - 1)]:
+            sfr.append(Fragment(p))
+    return sfr, staves
+
+
 def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_lines=False,
-                      merge_rows=False, stem_refine=False) -> Structures:
+                      merge_rows=False, stem_refine=False, seg=None) -> Structures:
     """Detect exported structures; ``robust=False`` preserves optimizer evidence.
 
     Recovered faint/broken lines are useful for page type and annotations, but
@@ -622,12 +678,16 @@ def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_l
     ``stem_refine=True`` re-centres vertical strokes on their thin part
     (``refine_strokes``) on pages with staves: traced with noteheads / flags
     they lean ~1-2 deg. (Jianpu-only pages: no consistent gain on dev.)
+    ``seg``: optional learned masks (``learned.masks``) on this image; staff
+    lines then come from the staff mask and strokes inside staff bands from
+    the stem mask (see ``_learned_staves``).
     """
     H, W = ink.shape
     thick, sp = run_metrics(ink)
     frags_pts, hmask = find_fragments(ink, thick, sp if sp else 12, horizontal=True)
     frags = [Fragment(p) for p in frags_pts]
     staves = group_staves(frags, W, sp if sp else None, bridge_gaps=robust)
+    n_lines = lambda st: sum(len(s.frag_ids) for s in st)
     if local_lines:
         block = max(15, min(H, W) // 50) | 1
         local_ink = cv2.adaptiveThreshold(norm, 1, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -635,7 +695,6 @@ def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_l
         local_thick, local_sp = run_metrics(local_ink)
         local_frags = [Fragment(p) for p in find_fragments(local_ink, local_thick, local_sp or 12)[0]]
         local_staves = group_staves(local_frags, W, local_sp or None, bridge_gaps=robust)
-        n_lines = lambda st: sum(len(s.frag_ids) for s in st)
         if n_lines(local_staves) > 1.1 * n_lines(staves):
             frags, staves, thick = local_frags, local_staves, local_thick
     elif robust and not staves:
@@ -653,6 +712,16 @@ def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_l
         if local_staves:
             frags, staves = local_frags, local_staves
             thick = local_thick
+    # learned staff mask: kept when it covers at least as much staff-line
+    # length as the classical evidence (dev 2026-11-18: the mask alone lost whole staves
+    # on low-resolution pages, recall 0.77 vs 0.88; positions equally accurate)
+    learned = _learned_staves(seg, ink, thick, W, robust) if seg is not None else None
+    # compare covered staff-line length, not fragment counts (the mask breaks
+    # lines into more pieces at noteheads)
+    cover = lambda fr, st: sum(float(np.ptp(fr[i].pts[:, 0])) for s_ in st for i in s_.frag_ids)
+    use_learned = learned is not None and cover(*learned) >= cover(frags, staves)
+    if use_learned:
+        frags, staves = learned
     if staves:
         sp = float(np.median([s.spacing for s in staves]))
     band = staff_band_mask(ink.shape, staves)
@@ -667,12 +736,24 @@ def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_l
     elif h_mode:
         cands.append(1.1 * h_mode)
     Lv = max(16, int(min(cands))) if cands else 25
-    vpts, _ = find_fragments(ink, thick, sp, horizontal=False, length=Lv)
+    vink = ink
+    # stems only where the network also sees the staves (or the staff channel
+    # is switched off for an ablation and the stem mask is not empty)
+    if seg is not None and "stem" in seg and staves and (
+            use_learned or ("staff" not in seg and seg["stem"].any())):
+        # inside the staff bands only the network's stems / barlines (no
+        # noteheads, flags, beams, slurs); jianpu / text strokes stay classical.
+        # Its classes are exclusive, so stems are cut at every staff line:
+        # add the staff pixels back (a horizontal line adds only its thickness
+        # to a vertical run, so it bridges stems without creating verticals).
+        stems = seg["stem"] | seg["staff"] if "staff" in seg else seg["stem"]
+        vink = np.where(band > 0, stems, ink).astype(np.uint8)
+    vpts, _ = find_fragments(vink, thick, sp, horizontal=False, length=Lv)
     if stem_refine and staves:
         # the bias comes from noteheads / flags, so only pages with staves.
         # Refining only the strokes inside the staff bands was worse on dev
         # (paired AD +0.03 on staff and on mixed pages, 2026-11-18).
-        vpts = refine_strokes(vpts, ink, min_span=0.55 * Lv)
+        vpts = refine_strokes(vpts, vink, min_span=0.55 * Lv)
     vsegs = []
     for p in vpts:
         if len(p) < 2:

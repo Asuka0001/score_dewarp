@@ -19,9 +19,10 @@ from .field import margin_stats
 from .gcs import GCSModel
 from .page import (detect_page_quad, estimate_skew, page_edges, page_mask, quad_homography, refine_page_mask,
                    rotation_homography)
-from .pipeline import Config, _detect, _finish
+from .pipeline import Config, _detect, _finish, _warp_seg
 from .preprocess import binarize, content_blobs, normalize_illumination, to_gray
-from .transforms import BackwardMap, photo_footprint
+from .structures import scale_structures
+from .transforms import BackwardMap, native_scale, photo_footprint
 
 
 # Tuned on the Doc3D-retextured dev split (data/bench/doc3d_score/dev), see
@@ -75,6 +76,8 @@ class MetricConfig:
     rect_max_kst: float = 0.05       # ... and a top -> bottom width change up to this
     rect_min_rows: int = 4
     residual: str = "field"          # none | field | mesh
+    output_res: str = "native"       # native: final output sampled at the photo's own resolution | canvas
+    seg: str = "off"                 # off | homr: learned staff-line / stem masks replace morphology (core/learned.py)
     field_iters: int = 3
     fit_kw: dict = None
     weights: dict = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
@@ -101,7 +104,7 @@ def coarse(img, cfg):
     return Hc, size, I1, quad, ang
 
 
-def detect_at_scale(img, Hc, size, I1, cfg, stages):
+def detect_at_scale(img, Hc, size, I1, cfg, stages, seg_src=None):
     """Detect structures; redo at a larger coarse scale for small staff lines.
 
     The detector works in integer pixels (run lengths >= 6 px). Dense scores
@@ -111,7 +114,7 @@ def detect_at_scale(img, Hc, size, I1, cfg, stages):
     (digit strokes) would upscale jianpu pages for nothing, which hurts them.
     """
     _, _, S = _detect(I1, robust=cfg.robust_detect, local_lines=cfg.local_lines, merge_rows=cfg.merge_rows,
-                      stem_refine=cfg.stem_refine)
+                      stem_refine=cfg.stem_refine, seg=_warp_seg(BackwardMap.from_homography(Hc, size), seg_src))
     if cfg.adaptive_scale != "off" and S.staves:
         sp = float(np.median([st.spacing for st in S.staves]))
         if sp < 9:
@@ -120,7 +123,8 @@ def detect_at_scale(img, Hc, size, I1, cfg, stages):
             size = (int(round(size[0] * f)), int(round(size[1] * f)))
             I1 = cv2.warpPerspective(img, Hc, size, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
             _, _, S = _detect(I1, robust=cfg.robust_detect, local_lines=cfg.local_lines, merge_rows=cfg.merge_rows,
-                              stem_refine=cfg.stem_refine)
+                              stem_refine=cfg.stem_refine,
+                              seg=_warp_seg(BackwardMap.from_homography(Hc, size), seg_src))
             stages["coarse_upscale"] = f
     return Hc, size, I1, S
 
@@ -209,8 +213,14 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
     stages["skew_deg"] = float(ang)
     T["coarse"] = time.time() - t0
 
+    seg_src = None
+    if cfg.seg == "homr":
+        from .learned import segment
+        t = time.time()
+        seg_src = segment(img)
+        T["segment"] = time.time() - t
     t = time.time()
-    Hc, size, I1, S1 = detect_at_scale(img, Hc, size, I1, cfg, stages)
+    Hc, size, I1, S1 = detect_at_scale(img, Hc, size, I1, cfg, stages, seg_src)
     bm = BackwardMap.from_homography(Hc, size)
     cur = I1
     stages["structures_coarse"] = S1.summary()
@@ -281,15 +291,42 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
         legacy = replace(legacy, use_field=False)
     res = _finish(img, cur, bm, legacy, stages, T, t0, verbose, local_lines=cfg.local_lines,
                   merge_rows=cfg.merge_rows, keep_pts=keep_pts if cfg.ink_extent else None,
-                  margin=cfg.margin if cfg.ink_extent else 0.0, stem_refine=cfg.stem_refine)
+                  margin=cfg.margin if cfg.ink_extent else 0.0, stem_refine=cfg.stem_refine, seg_src=seg_src)
     if cfg.rectify_margins:
         res = rectify_margins(img, res, cfg)
     ms = margin_stats(res.structures)
     if ms is not None:   # diagnostics: slant of the staves' left / right ends, width change top -> bottom
         res.stages["margins"] = {"left_deg": ms["left"][2], "right_deg": ms["right"][2], "keystone": ms["keystone"]}
+    if cfg.output_res == "native":
+        res = to_native(img, res)
     if paper_src is not None:
         res.paper = (res.bmap.apply(paper_src, interp=cv2.INTER_LINEAR, value=0) > 127).astype(np.uint8) * 255
     return res
+
+
+def to_native(img, res, tol=0.02):
+    """Resample the final output at the photo's resolution (one sampling of ``img``).
+
+    Detection and fitting run on a ~1600 px working canvas; a 12 MP photo
+    holds about twice that linear resolution on the page. The final map is
+    rescaled so that an output pixel covers ~one photo pixel (median over the
+    content, ``native_scale``) and the photo is sampled once more from the
+    original; structures / content points are scaled to the new canvas. Small
+    photos get a smaller output (the canvas would only upsample them)."""
+    t = time.time()
+    s = native_scale(res.bmap, img.shape[1::-1], res.content)
+    res.stages["output_scale"] = round(s, 4)
+    if abs(s - 1) < tol:
+        return res
+    bm = res.bmap.rescale(s)
+    image = bm.apply(img, value=255)
+    norm = normalize_illumination(to_gray(image))
+    content = None if res.content is None else np.asarray(res.content, float) * s
+    T = dict(res.timings)
+    T["native"] = time.time() - t
+    T["total"] = T.get("total", 0.0) + T["native"]
+    return replace(res, image=image, enhanced=norm, bmap=bm, structures=scale_structures(res.structures, s),
+                   content=content, timings=T)
 
 
 def rectify_margins(img, res, cfg):
@@ -331,8 +368,10 @@ def rectify_margins(img, res, cfg):
 
 
 BENCH_METHODS = {
-    "metric": lambda img: dewarp_metric(img, MetricConfig()),                 # the default pipeline
-    "gcs": lambda img: dewarp_metric(img, MetricConfig(residual="none")),     # surface only
+    # the bench measures geometry through the map; keep the working canvas so
+    # runs stay comparable with earlier ones (and fast)
+    "metric": lambda img: dewarp_metric(img, MetricConfig(output_res="canvas")),          # the default pipeline
+    "gcs": lambda img: dewarp_metric(img, MetricConfig(residual="none", output_res="canvas")),  # surface only
 }
 
 
@@ -364,5 +403,6 @@ def method_from_spec(spec: str):
             kw[k] = v
     if "field_iters" in kw:
         kw["field_iters"] = int(kw["field_iters"])
+    kw.setdefault("output_res", "canvas")   # bench: see BENCH_METHODS
     cfg = MetricConfig(**kw, fit_kw=fit or None)
     return lambda img: dewarp_metric(img, cfg)

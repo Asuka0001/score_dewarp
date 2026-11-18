@@ -54,11 +54,21 @@ class Result:
         return self.bmap.forward_points(pts)
 
 
-def _detect(img, *, robust=True, local_lines=False, merge_rows=False, stem_refine=False):
+def _detect(img, *, robust=True, local_lines=False, merge_rows=False, stem_refine=False, seg=None):
+    """``seg``: learned class map (``learned.segment``) already warped onto ``img``."""
     norm = normalize_illumination(to_gray(img))
     ink = binarize(norm)
+    from .learned import masks
     return norm, ink, detect_structures(norm, ink, robust=robust, local_lines=local_lines, merge_rows=merge_rows,
-                                        stem_refine=stem_refine)
+                                        stem_refine=stem_refine, seg=masks(seg, ink.shape))
+
+
+def _warp_seg(bm, seg_src):
+    if seg_src is None:
+        return None
+    # cv2.remap takes at most 4 channels with a border value
+    return np.dstack([bm.apply(np.ascontiguousarray(seg_src[..., i:i + 4]), interp=cv2.INTER_LINEAR, value=0)
+                      for i in range(0, seg_src.shape[2], 4)])
 
 
 def _filter_structures(S: Structures, priors):
@@ -198,7 +208,7 @@ def refine_dewarp(img: np.ndarray, initial_map: BackwardMap, cfg: Config | None 
 
 
 def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_rows=False,
-            keep_pts=None, margin=0.0, stem_refine=False):
+            keep_pts=None, margin=0.0, stem_refine=False, seg_src=None):
     """``keep_pts``: outline points of all printed content on ``cur``; the
     residual keeps them on its canvas, and the output is padded with white so
     that they keep ``margin`` (fraction of the content width) to every border."""
@@ -226,6 +236,7 @@ def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_
         t = time.time()
         for _ in range(cfg.field_iters):
             _, _, S2 = _detect(cur, robust=False, local_lines=local_lines, merge_rows=merge_rows,
+                               seg=_warp_seg(bm, seg_src),
                                stem_refine=stem_refine)
             S2f = _filter_structures(S2, cfg.field_priors)
             kw = {**(cfg.field_kw or {}), **((cfg.field_kw_type or {}).get(S2.page_type, {}))}
@@ -263,7 +274,7 @@ def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_
 
     # ---- D: outputs ------------------------------------------------------------
     t = time.time()
-    norm, ink, Sf = _detect(cur, merge_rows=merge_rows, stem_refine=stem_refine)
+    norm, ink, Sf = _detect(cur, merge_rows=merge_rows, stem_refine=stem_refine, seg=_warp_seg(bm, seg_src))
     enhanced = norm
     T["final_detect"] = time.time() - t
     T["total"] = time.time() - t0

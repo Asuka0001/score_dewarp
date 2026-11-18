@@ -38,6 +38,20 @@ class BackwardMap:
         src = fn(np.stack([gx.ravel(), gy.ravel()], 1)).reshape(gx.shape + (2,))
         return BackwardMap(src, stride, out_size)
 
+    def rescale(self, s: float) -> "BackwardMap":
+        """Same geometry on an output canvas scaled by ``s`` (still output -> photo)."""
+        W, H = self.out_size
+        size = (int(round(W * s)), int(round(H * s)))
+        return BackwardMap.from_function(lambda q: self.sample(q / s), size, self.stride)
+
+    def local_scale(self):
+        """Per grid cell: photo pixels per output pixel (sqrt |det J|), NaN off the photo map."""
+        g = np.asarray(self.grid, float)
+        dx = (g[:-1, 1:] - g[:-1, :-1]) / self.stride
+        dy = (g[1:, :-1] - g[:-1, :-1]) / self.stride
+        det = dx[..., 0] * dy[..., 1] - dx[..., 1] * dy[..., 0]
+        return np.sqrt(np.abs(det))
+
     # -- use ------------------------------------------------------------------
     def full_maps(self):
         W, H = self.out_size
@@ -87,6 +101,28 @@ class BackwardMap:
             self._inv = LinearNDInterpolator(src[ok], out[ok])
         pts = np.asarray(pts, float).reshape(-1, 2)
         return self._inv(pts)
+
+
+def native_scale(bmap: "BackwardMap", photo_size, content=None) -> float:
+    """Output scale at which one output pixel covers ~one photo pixel.
+
+    Median of the local scale over the printed content (convex hull of
+    ``content`` points, output coords) -- or over all cells that map into the
+    photo. The page is sampled unevenly (perspective, curl), so the median
+    keeps the typical photo resolution: parts nearer the camera are slightly
+    downsampled, farther parts slightly upsampled."""
+    ls = bmap.local_scale()
+    g = bmap.grid[:-1, :-1]
+    ok = np.isfinite(ls) & np.isfinite(g).all(-1)
+    ok &= (g >= 0).all(-1) & (g <= np.asarray(photo_size) - 1).all(-1)
+    if content is not None and len(content) >= 3:
+        hull = cv2.convexHull(np.asarray(content, np.float32))
+        gh, gw = ls.shape
+        m = np.zeros((gh, gw), np.uint8)
+        cv2.fillPoly(m, [np.round((hull.reshape(-1, 2) / bmap.stride)).astype(np.int32)], 1)
+        if (ok & (m > 0)).sum() >= 20:
+            ok &= m > 0
+    return float(np.median(ls[ok])) if ok.any() else 1.0
 
 
 def photo_footprint(src_pts, photo_size, gap, scale=0.25):

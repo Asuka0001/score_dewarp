@@ -42,6 +42,12 @@ def main():
     ap.add_argument("--out", default="outputs/run")
     ap.add_argument("--method", choices=("metric", "traditional"), default="metric")
     ap.add_argument("--no-field", action="store_true", help="skip the residual field after the surface fit")
+    ap.add_argument("--output-res", choices=("native", "canvas"), default="native",
+                    help="metric: native = rectified output at the photo's resolution (default); "
+                         "canvas = the ~1600 px working canvas")
+    ap.add_argument("--seg", choices=("off", "homr"), default="off",
+                    help="metric: learned staff-line / stem segmentation (needs onnxruntime and "
+                         "scripts/download_models.py)")
     ap.add_argument("--crop-content", action="store_true",
                     help="metric: output only the detected content box instead of the whole page")
     ap.add_argument("--binary", action="store_true", help="also write a black/white reading copy")
@@ -72,7 +78,7 @@ def main():
             name = os.path.basename(os.path.dirname(os.path.abspath(path)))
         if args.method == "metric":
             cfg = MetricConfig(residual="none" if args.no_field else MetricConfig.residual,
-                               full_page=not args.crop_content)
+                               full_page=not args.crop_content, seg=args.seg, output_res=args.output_res)
             res = dewarp_metric(img, cfg)
         else:
             res = dewarp(img, Config(use_field=not args.no_field))
