@@ -81,7 +81,7 @@ scoredewarp/
   synth/  render.py  fonts.py  doc3d_retexture.py                   渲染平整乐谱页、Doc3D 重贴图
 scripts/  dewarp.py (CLI)  bench.py  bench_report.py  make_doc3d_bench.py
           make_compare_figures.py  make_route_figures.py  make_align_figures.py
-          download_datasets.py  download_cpms.py  clean_cpms_mosaics.py
+          download_datasets.py  download_cpms.py
 tests/    python -m unittest discover tests
 reports/  metric_route_20261117.md（主线报告，补充一至五）与对比图
 ```
