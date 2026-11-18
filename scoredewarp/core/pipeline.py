@@ -48,15 +48,17 @@ class Result:
     stages: dict = field(default_factory=dict)
     timings: dict = field(default_factory=dict)
     paper: np.ndarray | None = None   # uint8 mask of the sheet on the output (metric pipeline)
+    content: np.ndarray | None = None  # (N, 2) outline points of all printed content on the output
 
     def forward_points(self, pts):
         return self.bmap.forward_points(pts)
 
 
-def _detect(img, *, robust=True, local_lines=False, merge_rows=False):
+def _detect(img, *, robust=True, local_lines=False, merge_rows=False, stem_refine=False):
     norm = normalize_illumination(to_gray(img))
     ink = binarize(norm)
-    return norm, ink, detect_structures(norm, ink, robust=robust, local_lines=local_lines, merge_rows=merge_rows)
+    return norm, ink, detect_structures(norm, ink, robust=robust, local_lines=local_lines, merge_rows=merge_rows,
+                                        stem_refine=stem_refine)
 
 
 def _filter_structures(S: Structures, priors):
@@ -195,7 +197,12 @@ def refine_dewarp(img: np.ndarray, initial_map: BackwardMap, cfg: Config | None 
     return _finish(img, cur, bm, cfg, stages, T, t0, verbose)
 
 
-def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_rows=False):
+def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_rows=False,
+            keep_pts=None, margin=0.0, stem_refine=False):
+    """``keep_pts``: outline points of all printed content on ``cur``; the
+    residual keeps them on its canvas, and the output is padded with white so
+    that they keep ``margin`` (fraction of the content width) to every border."""
+
     # Absolute line-level constraints replace C for reliable staff systems.
     # Each accepted residual is monotone and preserves its full input canvas.
     mesh_info = None
@@ -212,32 +219,53 @@ def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_
         if residual is not None:
             bm = bm.compose(residual)
             cur = bm.apply(img, value=255)
+            keep_pts = None   # no forward map for the mesh
         T['line_mesh'] = time.time() - t
     # ---- C: residual field ---------------------------------------------------
     if cfg.use_field and (mesh_info is None or mesh_info['staff_systems'] == 0):
         t = time.time()
         for _ in range(cfg.field_iters):
-            _, _, S2 = _detect(cur, robust=False, local_lines=local_lines, merge_rows=merge_rows)
+            _, _, S2 = _detect(cur, robust=False, local_lines=local_lines, merge_rows=merge_rows,
+                               stem_refine=stem_refine)
             S2f = _filter_structures(S2, cfg.field_priors)
             kw = {**(cfg.field_kw or {}), **((cfg.field_kw_type or {}).get(S2.page_type, {}))}
-            fb = fit_field(S2f, node=cfg.field_node, priors=cfg.field_priors, **kw)
+            fb = fit_field(S2f, node=cfg.field_node, priors=cfg.field_priors, keep_pts=keep_pts, **kw)
             if fb is None:
                 break
+            if keep_pts is not None:
+                keep_pts = fb.forward(keep_pts)
             sc = stages.setdefault("field_scale", [1.0, 1.0])   # product over iterations
-            stages["field_scale"] = [sc[0] * fb.field_scale[0], sc[1] * fb.field_scale[1]]
+            fs = getattr(fb, "field_scale", (1.0, 1.0))
+            stages["field_scale"] = [sc[0] * fs[0], sc[1] * fs[1]]
             bm = bm.compose(fb)
             cur = bm.apply(img, value=255)
         T["field"] = time.time() - t
 
+    if keep_pts is not None and len(keep_pts) and margin > 0:
+        # content keeps a margin to every border, like a printed page. Added
+        # after the residual (a wider canvas changes its fit: keep_scale
+        # averages over the whole canvas) and white: continuing the photo past
+        # the fitted surface shows smeared paper rims or, past a fold, the page
+        # a second time.
+        W, H = bm.out_size
+        (x0, y0), (x1, y1) = keep_pts.min(0), keep_pts.max(0)
+        m = margin * (x1 - x0)
+        pad = [int(np.ceil(max(0.0, v))) for v in (m - x0, m - y0, x1 + m - (W - 1), y1 + m - (H - 1))]
+        if any(pad):
+            bm = bm.pad(*pad)
+            keep_pts = keep_pts + pad[:2]
+            cur = bm.apply(img, value=255)
+        stages["content_pad"] = pad
+
     # ---- D: outputs ------------------------------------------------------------
     t = time.time()
-    norm, ink, Sf = _detect(cur, merge_rows=merge_rows)
+    norm, ink, Sf = _detect(cur, merge_rows=merge_rows, stem_refine=stem_refine)
     enhanced = norm
     T["final_detect"] = time.time() - t
     T["total"] = time.time() - t0
     if verbose:
         print({k: round(v, 2) for k, v in T.items()}, Sf.summary())
-    return Result(cur, enhanced, bm, Sf, Sf.page_type, stages, T)
+    return Result(cur, enhanced, bm, Sf, Sf.page_type, stages, T, content=keep_pts)
 
 
 def result_json(res: Result):

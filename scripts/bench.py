@@ -19,6 +19,9 @@ whole-page alignment above, so a global squeeze of the page cannot lower tilts):
   jp_base    jianpu baseline std / digit height, jp_hcv, jp_tilt
   bar_jp, bar_jp_sd   jianpu barline tilt / per-page spread (parallelism)
   lalign     staves' left ends (clefs) max horizontal misalignment, in spacings
+             (after an affine fit: blind to a sheared margin)
+  edge_deg   slant of the staves' left-end / right-end lines vs the flat (deg)
+  kst        keystone: staff width change top -> bottom staff vs the flat (%)
 
   python scripts/bench.py --data data/bench/doc3d_score/dev --methods abc ab --out outputs/bench/dev
 """
@@ -249,7 +252,44 @@ def alignment(gt, fwd, size):
         A = np.stack([F[:, 0], F[:, 1], np.ones(len(F))], 1)
         coef, *_ = np.linalg.lstsq(A, O[:, 0], rcond=None)
         out["lalign"] = float(np.abs(A @ coef - O[:, 0]).max() / np.median(S))
+    out.update(_margins(lines, fwd, size, gt["meta"]["size"][0]))
     return out
+
+
+def _margins(lines, fwd, size, flat_w):
+    """Text-block margins (needs ``fwd`` in the flat frame, i.e. after the
+    whole-page alignment): the staves' left ends and right ends lie on two
+    vertical lines of the flat page.
+      edge_deg  mean |angle| of the left-end and right-end lines relative to
+                the flat (shear / slanted margin), deg
+      kst       keystone: staff width change from the top to the bottom staff
+                relative to the flat (a fitted trend, %), e.g. 3 = the bottom
+                staff is 3 % narrower or wider than the top one
+    ``lalign`` cannot see either: its affine fit absorbs a sheared margin."""
+    rows = []
+    for st in lines.values():
+        if 0 not in st or 4 not in st:
+            continue
+        (f0, p0), (f4, p4) = st[0], st[4]
+        ends = np.stack([p0[0], p4[0], p0[-1], p4[-1]])
+        if not np.isfinite(ends).all():
+            continue
+        q = _fwd_ok(fwd, size, ends)
+        if not np.isfinite(q).all():
+            continue
+        fl = np.stack([f0[0], f4[0], f0[-1], f4[-1]]) / flat_w
+        rows.append((fl[:, 1].mean(), fl[:2, 0].mean(), fl[2:, 0].mean(), q[:2, 0].mean(), q[2:, 0].mean()))
+    if len(rows) < 3:
+        return {}
+    y, fL, fR, oL, oR = np.array(rows).T
+    if np.ptp(y) < 1e-6:
+        return {}
+    kL = np.polyfit(y, oL - fL, 1)[0]
+    kR = np.polyfit(y, oR - fR, 1)[0]
+    ratio = (oR - oL) / (fR - fL)
+    kw = np.polyfit(y, ratio, 1)[0]
+    return {"edge_deg": float(np.degrees(0.5 * (abs(np.arctan(kL)) + abs(np.arctan(kR))))),
+            "kst": float(abs(kw) * np.ptp(y) / np.median(ratio) * 100)}
 
 
 def run_one(args):
@@ -294,7 +334,7 @@ def run_one(args):
 
 # ---------------------------------------------------------------- report -----
 KEYS = ["ad_c", "ld_c", "cover_c", "ad", "ld", "cover", "straight", "spacing_cv", "vtilt", "jp_base", "jp_hcv", "jp_tilt",
-        "bar_jp", "bar_jp_sd", "lalign", "time"]
+        "bar_jp", "bar_jp_sd", "lalign", "edge_deg", "kst", "time"]
 ALIAS = {"staff_straight": "straight", "staff_spacing_cv": "spacing_cv", "jp_baseline": "jp_base",
          "jp_height_cv": "jp_hcv", "jp_tilt_deg": "jp_tilt"}
 LOWER_BETTER = {k: not k.startswith("cover") for k in KEYS}
@@ -337,7 +377,8 @@ def summarize(rows, methods):
         for m in methods:
             if m == base:
                 continue
-            for k in ("ad_c", "ld_c", "cover_c", "ad", "straight", "vtilt", "jp_base", "jp_tilt", "bar_jp_sd", "lalign"):
+            for k in ("ad_c", "ld_c", "cover_c", "ad", "straight", "vtilt", "jp_base", "jp_tilt", "bar_jp_sd", "lalign",
+                      "edge_deg", "kst"):
                 d = []
                 for s in samples:
                     a, b = by.get((s, m), {}), by.get((s, base), {})

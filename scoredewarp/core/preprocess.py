@@ -82,25 +82,53 @@ def protect_content(region: np.ndarray, image: np.ndarray, spacing: float | None
     stays outside: it lies mostly outside the region, and background texture
     is too sparse.
     """
+    blobs, _ = content_blobs(image, region, spacing, min_inside, min_density)
+    out = region.copy()
+    out[blobs > 0] = 255
+    return out
+
+
+def content_blobs(image: np.ndarray, region: np.ndarray, spacing: float | None = None,
+                  min_inside: float = 0.25, min_density: float = 0.15, min_thick: float = 0.0,
+                  long: float = 25.0, min_size: float = 0.0, valid: np.ndarray | None = None):
+    """Printed content belonging to ``region`` (see ``protect_content``).
+
+    Returns (blob mask, ink mask), uint8 0/255 and 0/1: the dilated print-like
+    blobs lying at least ``min_inside`` within the region, and the ink.
+    ``min_thick`` (staff spacings): a long blob (>= ``long`` spacings) must
+    have at least this half-thickness (max. distance to its border) -- staves
+    and text rows do (>= 1.3), a dark paper rim or a rule along the page does
+    not (~0.7). Short thin marks (hairpins, slurs, numbers) are kept.
+    ``min_size`` (spacings): the ink of a blob must span at least this much
+    (drops background speckle). ``valid``: ink outside it is ignored."""
     gray = to_gray(image)
     sp = _spacing_or_default(gray.shape, spacing)
     ink = (_flatten_shading(gray, sp) < 150).astype(np.uint8)
     ink = cv2.morphologyEx(ink, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    if valid is not None:
+        ink &= (valid > 0).astype(np.uint8)
     k = max(5, int(round(1.2 * sp))) | 1
     blobs = cv2.dilate(ink, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
     n, lab, stats, _ = cv2.connectedComponentsWithStats(blobs, connectivity=8)
     if n <= 1:
-        return region
+        return np.zeros_like(ink), ink
     area = np.maximum(stats[:, cv2.CC_STAT_AREA], 1).astype(float)
     frac = np.bincount(lab[region > 0], minlength=n) / area
     # printed content is dense (a dilated staff / text line is ~20-27 % ink);
     # flattened background texture (cloth, wood) is sparse speckle (~4 %)
     density = np.bincount(lab[ink > 0], minlength=n) / area
     keep = (frac >= min_inside) & (density >= min_density)
+    if min_thick > 0:
+        dist = cv2.distanceTransform(blobs, cv2.DIST_L2, 3)
+        thick = np.zeros(n)
+        np.maximum.at(thick, lab.ravel(), dist.ravel())
+        length = np.maximum(stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT])
+        keep &= (thick >= min_thick * sp) | (length < long * sp)
+    if min_size > 0:   # blob = ink dilated by k: its size minus k is the ink's span
+        span = np.maximum(stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT]) - k
+        keep &= span >= min_size * sp
     keep[0] = False
-    out = region.copy()
-    out[keep[lab]] = 255
-    return out
+    return keep[lab].astype(np.uint8) * 255, ink
 
 
 def clean_page(img: np.ndarray, paper: np.ndarray | None = None, spacing: float | None = None,
@@ -135,7 +163,8 @@ def clean_page(img: np.ndarray, paper: np.ndarray | None = None, spacing: float 
 
 
 def paper_region(mask: np.ndarray | None, image: np.ndarray | None = None, band=0.08,
-                 dark=0.5, spacing: float | None = None, protect: bool = True) -> np.ndarray | None:
+                 dark=0.5, spacing: float | None = None, protect: bool = True,
+                 content: np.ndarray | None = None) -> np.ndarray | None:
     """Sheet region on the output for ``clean_page``, from a warped paper mask.
 
     The convex hull fills dents (missed shadowed paper), shrunk a little so the
@@ -144,7 +173,10 @@ def paper_region(mask: np.ndarray | None, image: np.ndarray | None = None, band=
     itself, shrunk, decides, and with ``image`` large dark areas (a table the
     mask leaked into; thin ink is blurred away) are dropped as well. With
     ``image`` the result is finally grown over content blobs it cuts through
-    (``protect_content``): whitening must never erase music.
+    (``protect_content``): whitening must never erase music. ``content``
+    (outline points of the printed content, ``Result.content``): their convex
+    hull is always on the sheet -- the mask can stop short of a shaded last
+    system that the dewarping kept.
     """
     if mask is None or mask.mean() / 255 < 0.15:
         return None
@@ -165,6 +197,8 @@ def paper_region(mask: np.ndarray | None, image: np.ndarray | None = None, band=
         level = np.percentile(g[core > 0], 75)
         near &= g >= dark * level
     region = np.where((core > 0) | ((hull > 0) & near), 255, 0).astype(np.uint8)
+    if content is not None and len(content) >= 3:
+        cv2.fillPoly(region, [cv2.convexHull(np.round(content).astype(np.int32))], 255)
     if image is not None and protect:
         region = protect_content(region, image, spacing)
     return region

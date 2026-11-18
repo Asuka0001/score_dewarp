@@ -553,8 +553,63 @@ def find_text_rows(ink, line_len, band, *, reject_boxes=True, merge_rows=False):
     return rows, h_mode
 
 
+def _stroke_runs(ink, p, reach=20):
+    """Per image row along a traced vertical stroke: (y, left, right) of the
+    ink run under the trace (NaN where the trace is on paper)."""
+    H, W = ink.shape
+    ys = np.arange(max(0, int(np.ceil(p[0, 1]))), min(H - 1, int(np.floor(p[-1, 1]))) + 1)
+    xs = np.rint(np.interp(ys, p[:, 1], p[:, 0])).astype(int)
+    out = np.full((len(ys), 3), np.nan)
+    out[:, 0] = ys
+    for i, (y, x) in enumerate(zip(ys, xs)):
+        lo, hi = max(0, x - reach), min(W, x + reach + 1)
+        row = ink[y, lo:hi] > 0
+        c = x - lo
+        hit = [c + d for d in (0, -1, 1, -2, 2) if 0 <= c + d < len(row) and row[c + d]]
+        if not hit:
+            continue
+        c = hit[0]
+        z = np.flatnonzero(~row[:c])
+        a = z[-1] + 1 if len(z) else 0
+        z = np.flatnonzero(~row[c:])
+        b = c + z[0] - 1 if len(z) else len(row) - 1
+        out[i, 1:] = a + lo, b + lo
+    return out
+
+
+def refine_strokes(segs, ink, min_span, tol=1.0, step=3):
+    """Re-centre traced vertical strokes on their thin part only.
+
+    A stem is traced together with whatever touches it: the notehead at one
+    end (left of an up-stem's foot, right of a down-stem's head), a flag or
+    beam at the other. Both pull the traced centre the same way, so stems on a
+    flat page read ~1-2 deg off vertical (median -1 deg on the dev flats) --
+    and the residual field, which trusts them, shears the page by that much.
+    Rows where the ink run under the trace is wider than the page's stroke
+    width (median run) + ``tol`` px are junctions; the stroke is re-centred
+    from the remaining rows of the binary image. Strokes left shorter than
+    ``min_span`` px are dropped."""
+    R = [_stroke_runs(ink, p) for p in segs if len(p) >= 2]
+    w = np.concatenate([r[:, 2] - r[:, 1] + 1 for r in R]) if R else np.zeros(0)
+    w = w[np.isfinite(w)]
+    if not len(w):
+        return []
+    w_max = float(np.median(w)) + tol
+    out = []
+    for r in R:
+        ok = (r[:, 2] - r[:, 1] + 1) <= w_max      # NaN rows fail too
+        if ok.sum() < 3:
+            continue
+        y, c = r[ok, 0], 0.5 * (r[ok, 1] + r[ok, 2])
+        if y[-1] - y[0] < min_span:
+            continue
+        keep = np.unique(np.concatenate([np.arange(0, len(y), step), [len(y) - 1]]))
+        out.append(np.stack([c[keep], y[keep]], 1))
+    return out
+
+
 def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_lines=False,
-                      merge_rows=False) -> Structures:
+                      merge_rows=False, stem_refine=False) -> Structures:
     """Detect exported structures; ``robust=False`` preserves optimizer evidence.
 
     Recovered faint/broken lines are useful for page type and annotations, but
@@ -564,6 +619,9 @@ def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_l
     noteheads are lost by global Otsu even when some staves survive).
     ``merge_rows=True`` joins jianpu / text row pieces split by wide gaps
     (``_merge_chains``) before rows are classified.
+    ``stem_refine=True`` re-centres vertical strokes on their thin part
+    (``refine_strokes``) on pages with staves: traced with noteheads / flags
+    they lean ~1-2 deg. (Jianpu-only pages: no consistent gain on dev.)
     """
     H, W = ink.shape
     thick, sp = run_metrics(ink)
@@ -610,6 +668,11 @@ def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_l
         cands.append(1.1 * h_mode)
     Lv = max(16, int(min(cands))) if cands else 25
     vpts, _ = find_fragments(ink, thick, sp, horizontal=False, length=Lv)
+    if stem_refine and staves:
+        # the bias comes from noteheads / flags, so only pages with staves.
+        # Refining only the strokes inside the staff bands was worse on dev
+        # (paired AD +0.03 on staff and on mixed pages, 2026-11-18).
+        vpts = refine_strokes(vpts, ink, min_span=0.55 * Lv)
     vsegs = []
     for p in vpts:
         if len(p) < 2:

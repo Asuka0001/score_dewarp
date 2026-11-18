@@ -113,8 +113,71 @@ def _sub(pts, d):
     return pts[keep]
 
 
+def _row_ends(S: Structures, side, reject=1.5):
+    """One end point per staff row, outliers removed: (N, 2) array.
+
+    A row's end is where its staff lines end: per line the outermost fragment
+    end (staves the detector split into pieces at one height form one row),
+    then the line with the median x (one line running on into a hairpin or cut
+    short by a clef does not move it). Not the 5-line tuples: notes and clefs
+    interrupt those, so they stop up to several spacings short of the ends.
+    Rows more than ``reject`` spacings off a robust line through all ends are
+    dropped: an indented first system, a short last staff of an exercise."""
+    from scipy.stats import theilslopes
+    from .gcs import _staff_rows
+    row = _staff_rows(S.staves)
+    ext = {}
+    for k, st in enumerate(S.staves):
+        for fi in st.frag_ids:
+            f = S.fragments[fi]
+            if len(f.pts) < 2 or f.line < 0:
+                continue
+            p = f.pts[0] if side == 0 else f.pts[-1]
+            key = (row[k], f.line)
+            if key not in ext or (p[0] < ext[key][0] if side == 0 else p[0] > ext[key][0]):
+                ext[key] = p
+    by_row = {}
+    for (r, _), p in ext.items():
+        by_row.setdefault(r, []).append(p)
+    P = []
+    for r in sorted(by_row):
+        q = np.array(by_row[r])
+        if len(q) >= 3:
+            P.append(q[np.argsort(q[:, 0])[len(q) // 2]])
+    if len(P) < 3:
+        return np.zeros((0, 2))
+    P = np.array(P)
+    sp = float(np.median([st.spacing for st in S.staves]))
+    k, c = theilslopes(P[:, 0], P[:, 1])[:2]
+    ok = np.abs(P[:, 0] - (c + k * P[:, 1])) < reject * sp
+    return P[ok] if ok.sum() >= 3 else np.zeros((0, 2))
+
+
+def margin_stats(S: Structures, min_rows=3):
+    """Text-block margins of a (corrected) page from its staves, or None:
+    left / right: (x at the top row, x at the bottom row, slant in deg; + = the
+    margin runs right going down), keystone: bottom / top staff width - 1,
+    lines: side -> (slope, intercept) of x = intercept + slope * y, y: (top, bottom)
+    row, n: rows used per side."""
+    out, lines, ys, n = {}, {}, [], {}
+    for side, name in ((0, "left"), (-1, "right")):
+        P = _row_ends(S, side)
+        if len(P) < min_rows or np.ptp(P[:, 1]) <= 0:
+            return None
+        k, c = np.polyfit(P[:, 1], P[:, 0], 1)
+        lines[name], n[name] = (float(k), float(c)), len(P)
+        ys += [P[:, 1].min(), P[:, 1].max()]
+    y0, y1 = min(ys), max(ys)
+    for name, (k, c) in lines.items():
+        out[name] = (c + k * y0, c + k * y1, float(np.degrees(np.arctan(k))))
+    (l0, l1, _), (r0, r1, _) = out["left"], out["right"]
+    out["keystone"] = float((r1 - l1) / max(r0 - l0, 1e-9) - 1)
+    out.update(lines=lines, y=(float(y0), float(y1)), n=n)
+    return out
+
+
 def build_constraints(S: Structures, grid, priors=("staff", "jianpu", "text", "vertical"), tuple_u=0.3, vseg_w=0.6,
-                      spacing_gate=0.2, ends_w=0.0):
+                      spacing_gate=0.2, ends_w=0.0, ends_mode="chain"):
     """``tuple_u`` ties U of the 5 staff lines at one *current* image column, which
     preserves whatever shear the current image has; 0 lets vertical strokes decide.
     ``spacing_gate``: a staff (jianpu row) whose spacing (digit height) deviates
@@ -122,7 +185,10 @@ def build_constraints(S: Structures, grid, priors=("staff", "jianpu", "text", "v
     genuinely smaller staff would; larger values pull badly fitted staves back.
     ``ends_w``: the staves' left ends (clefs) and right ends share one U each
     (justified systems; an indented first system is an outlier for the robust
-    solve), as in the margin constraints of Stamatopoulos et al. 2011."""
+    solve), as in the margin constraints of Stamatopoulos et al. 2011.
+    ``ends_mode``: "chain" ties consecutive staves' extreme tuples (a staff split
+    into pieces, or an indented / short staff, breaks two links); "rows" one
+    end per staff row with outliers removed (``_row_ends``)."""
     U, V = _System(grid), _System(grid)
     staves = S.staves if "staff" in priors else []
     s_all = [st.spacing for st in staves]
@@ -146,7 +212,12 @@ def build_constraints(S: Structures, grid, priors=("staff", "jianpu", "text", "v
             V.diff(p[1:], p[:-1], 0.0, 1.0)
             sc = s_t / np.interp((p[1:, 0] + p[:-1, 0]) / 2, xs_t[order], loc[order])
             U.diff(p[1:], p[:-1], np.linalg.norm(np.diff(p, axis=0), axis=1) * sc, 0.5)
-    if ends_w > 0 and len(staves) >= 3:
+    if ends_w > 0 and len(staves) >= 3 and ends_mode == "rows":
+        for side in (0, -1):
+            pts = _row_ends(S, side)
+            if len(pts) >= 3:
+                U.diff(pts[1:], pts[:-1], 0.0, ends_w)
+    elif ends_w > 0 and len(staves) >= 3:
         for side in (0, -1):
             pts = []
             for st in staves:
@@ -208,16 +279,21 @@ def _content_points(S: Structures):
 
 def fit_field(S: Structures, node=48, lam=6.0, mu=0.02, priors=("staff", "jianpu", "text", "vertical"),
               tuple_u=0.3, vseg_w=0.6, lam_u=None, lam_v=None, spacing_gate=0.2, ends_w=0.0, keep_scale=False,
-              anchor=False):
+              anchor=False, keep_pts=None, ends_mode="chain"):
     """``lam_u`` / ``lam_v`` override the smoothness per component: V is pinned by
     many reliable staff lines, U only by short, noisier vertical strokes.
     ``keep_scale``: constrain U and V to unit mean gradient in the solve (global
     scale and aspect stay as the metric surface model set them).
     ``anchor``: place the result so that the detected content keeps its left /
-    top margins, and grow the canvas instead of cutting content off."""
+    top margins, and grow the canvas instead of cutting content off.
+    ``keep_pts``: further content points for the anchor (outlines of all
+    printed content: notes below the staves, dynamics, exercise numbers),
+    which the detected structures alone miss.
+    The returned map carries ``forward(pts)``: input -> output coordinates."""
     H, W = S.shape
     g = _Grid(W, H, node)
-    U, V = build_constraints(S, g, priors, tuple_u=tuple_u, vseg_w=vseg_w, spacing_gate=spacing_gate, ends_w=ends_w)
+    U, V = build_constraints(S, g, priors, tuple_u=tuple_u, vseg_w=vseg_w, spacing_gate=spacing_gate, ends_w=ends_w,
+                             ends_mode=ends_mode)
     if not U.A or not V.A:
         return None
     if keep_scale:
@@ -235,6 +311,8 @@ def fit_field(S: Structures, node=48, lam=6.0, mu=0.02, priors=("staff", "jianpu
     scale = tuple(float(np.diff(c.reshape(g.ny, g.nx), axis=ax).mean() / node) for c, ax in ((u, 1), (v, 0)))
     UV = np.stack([u, v], 1).reshape(g.ny, g.nx, 2)
     pts = _content_points(S) if anchor else None
+    if pts is not None and keep_pts is not None and len(keep_pts):
+        pts = np.concatenate([pts, np.asarray(keep_pts, float).reshape(-1, 2)])
     if pts is not None and len(pts) >= 10:
         # keep the content's left / top margins and grow the canvas when the
         # content got wider or taller: a mean-displacement recentring lets the
@@ -264,5 +342,6 @@ def fit_field(S: Structures, node=48, lam=6.0, mu=0.02, priors=("staff", "jianpu
 
     bm = BackwardMap.from_function(fn, (Wo, Ho), stride=4)
     bm.forward_nodes = UV
+    bm.forward = lambda p: g.weights(p) @ UV.reshape(-1, 2)
     bm.field_scale = scale
     return bm

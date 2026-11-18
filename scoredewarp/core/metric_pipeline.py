@@ -15,17 +15,20 @@ from dataclasses import dataclass, field, replace
 import cv2
 import numpy as np
 
+from .field import margin_stats
 from .gcs import GCSModel
 from .page import (detect_page_quad, estimate_skew, page_edges, page_mask, quad_homography, refine_page_mask,
                    rotation_homography)
 from .pipeline import Config, _detect, _finish
-from .preprocess import binarize, normalize_illumination, to_gray
-from .transforms import BackwardMap
+from .preprocess import binarize, content_blobs, normalize_illumination, to_gray
+from .transforms import BackwardMap, photo_footprint
 
 
 # Tuned on the Doc3D-retextured dev split (data/bench/doc3d_score/dev), see
 # reports/metric_route_20261117.md. Vertical strokes need a high weight: they are
-# the only evidence against shear, and horizontal lines outnumber them. The
+# the only evidence against shear, and horizontal lines outnumber them -- so
+# they must be unbiased: stems traced with their noteheads / flags lean ~1 deg
+# (MetricConfig.stem_refine). The
 # residual field is smoothed per component: V is pinned by many reliable staff
 # lines (soft), U only by short, noisier strokes (stiffer).
 DEFAULT_WEIGHTS = {"vseg": 5.0}
@@ -39,8 +42,12 @@ DEFAULT_WEIGHTS = {"vseg": 5.0}
 # keep_scale: the field must not change the page's global scale / aspect, which
 # the bench cannot see (its alignment fits X and Y scale separately); anchor:
 # nor slide content off the canvas.
+# 2026-11-18 (dev, round 4): the staves' ends per staff ROW from the line
+# fragments, indented / short staves dropped (ends_mode rows): the 5-line
+# tuples stop short of the ends and split staves broke the chain, so the
+# margins kept a slant / keystone (the "top wide, bottom narrow" CPMS pages).
 DEFAULT_FIELD = {"tuple_u": 0.0, "vseg_w": 4.0, "lam_u": 3.0, "lam_v": 0.5, "spacing_gate": 9.0, "ends_w": 2.0,
-                 "keep_scale": True, "anchor": True}
+                 "ends_mode": "rows", "keep_scale": True, "anchor": True}
 DEFAULT_FIELD_TYPE = {"jianpu": {"vseg_w": 8.0}, "mixed": {"lam_u": 1.5}}   # on top of DEFAULT_FIELD
 
 
@@ -49,6 +56,8 @@ class MetricConfig:
     coarse_width: int = 1600
     robust_detect: bool = False
     local_lines: bool = True
+    stem_refine: bool = True         # vertical strokes re-centred on their thin part (no notehead / flag pull)
+    gcs_ends: str = "all"            # all: every outer-line fragment end | rows: only each staff row's outer ends
     merge_rows: bool = False         # join jianpu / text row pieces split by wide gaps
     adaptive_scale: str = "staff"   # staff: upscale when detected staves are small | off
     full_page: bool = True
@@ -59,6 +68,12 @@ class MetricConfig:
     edge_max_err: float = 4.0        # px; a side fitted worse than this is not used for the extent
     edge_widen: bool = True          # re-space the slope knots over the borders
     focal_scale: float = 1.0
+    ink_extent: bool = True          # output holds all printed content on the sheet, not only the structures
+    margin: float = 0.03             # min. content-to-border distance, fraction of the content width
+    rectify_margins: bool = False    # final per-row stretch of the staves' ends onto two vertical lines (neutral on dev)
+    rect_max_deg: float = 2.0        # ... only for a margin slant up to this
+    rect_max_kst: float = 0.05       # ... and a top -> bottom width change up to this
+    rect_min_rows: int = 4
     residual: str = "field"          # none | field | mesh
     field_iters: int = 3
     fit_kw: dict = None
@@ -95,7 +110,8 @@ def detect_at_scale(img, Hc, size, I1, cfg, stages):
     ~12 px. Only measured staff spacing triggers this: other periodic ink
     (digit strokes) would upscale jianpu pages for nothing, which hurts them.
     """
-    _, _, S = _detect(I1, robust=cfg.robust_detect, local_lines=cfg.local_lines, merge_rows=cfg.merge_rows)
+    _, _, S = _detect(I1, robust=cfg.robust_detect, local_lines=cfg.local_lines, merge_rows=cfg.merge_rows,
+                      stem_refine=cfg.stem_refine)
     if cfg.adaptive_scale != "off" and S.staves:
         sp = float(np.median([st.spacing for st in S.staves]))
         if sp < 9:
@@ -103,9 +119,82 @@ def detect_at_scale(img, Hc, size, I1, cfg, stages):
             Hc = np.diag([f, f, 1.0]) @ Hc
             size = (int(round(size[0] * f)), int(round(size[1] * f)))
             I1 = cv2.warpPerspective(img, Hc, size, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            _, _, S = _detect(I1, robust=cfg.robust_detect, local_lines=cfg.local_lines, merge_rows=cfg.merge_rows)
+            _, _, S = _detect(I1, robust=cfg.robust_detect, local_lines=cfg.local_lines, merge_rows=cfg.merge_rows,
+                              stem_refine=cfg.stem_refine)
             stages["coarse_upscale"] = f
     return Hc, size, I1, S
+
+
+def grow_to_content(model, img, extent, spacing, margin=0.0, look=0.15, scale=0.5):
+    """Grow the flat output box over all printed content on the sheet.
+
+    The surface is fitted to staff lines / rows / strokes, and the page box is
+    limited by the paper mask; notes and hairpins below the last staff, a lone
+    exercise number or a sheet running out of a shaded photo edge lie outside
+    both. A half-resolution preview of the box widened by ``look`` is searched
+    for print-like blobs mostly inside the box (``content_blobs``, as for the
+    reading copy); the box then holds their ink plus ``margin`` (fraction of the
+    content width) on every side. The pipeline adds its margin only after the
+    residual (``_finish``), so it calls this with ``margin=0``.
+    Returns (box, outline points of the content in the output pixels of the
+    returned box, or None).
+    """
+    x0, x1, y0, y1 = extent
+    gx, gy = look * (x1 - x0), look * (y1 - y0)
+    big = (x0 - gx, x1 + gx, y0 - gy, y1 + gy)
+    ppu = model.unit * scale
+    bmp = model.backward_map(big, out_scale=scale)
+    # shrink the photo first (area filter) so thin lines survive the remap
+    f = min(1.0, 1.5 * bmp.out_size[0] / img.shape[1])
+    src = cv2.resize(to_gray(img), None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else to_gray(img)
+    prev = BackwardMap(bmp.grid * f, bmp.stride, bmp.out_size).apply(src, interp=cv2.INTER_LINEAR, value=255)
+    region = np.zeros(prev.shape, np.uint8)
+    region[int(gy * ppu):int((gy + y1 - y0) * ppu), int(gx * ppu):int((gx + x1 - x0) * ppu)] = 255
+    # Beyond the visible sheet the surface is extrapolated and may run back
+    # onto photo pixels the page box already shows (a second copy of the score
+    # past a fold): outside the box, keep only points whose photo pixels are
+    # not in the box's footprint.
+    g = bmp.grid
+    gh, gw = g.shape[:2]
+    oy, ox = np.mgrid[0:gh, 0:gw] * bmp.stride
+    inbox = region[np.clip(oy, 0, region.shape[0] - 1), np.clip(ox, 0, region.shape[1] - 1)] > 0
+    gap = bmp.stride * img.shape[1] / max(bmp.out_size[0], 1)
+    dup = photo_footprint(g[inbox], img.shape[1::-1], gap)(g)
+    bad = (~inbox & dup).astype(np.uint8)
+    bad = cv2.resize(bad, prev.shape[::-1], interpolation=cv2.INTER_NEAREST) > 0
+    prev[bad & (region == 0)] = 255
+    # off the photo the preview is white; the shading flattening turns the
+    # dark background next to it into a false ink line -> ignore that rim
+    inph = BackwardMap(bmp.grid, bmp.stride, bmp.out_size).full_maps()
+    inph = (inph[0] >= 0) & (inph[0] <= img.shape[1] - 1) & (inph[1] >= 0) & (inph[1] <= img.shape[0] - 1)
+    r = max(3, int(round(2 * spacing * scale))) | 1
+    valid = cv2.erode(inph.astype(np.uint8), np.ones((r, r), np.uint8))
+    # where the extrapolated surface spreads few photo pixels over many output
+    # pixels (past a curled edge) the paper rim is smeared into ink-like streaks
+    sx = np.linalg.norm(np.diff(g, axis=1), axis=-1)[:-1]
+    sy = np.linalg.norm(np.diff(g, axis=0), axis=-1)[:, :-1]
+    sc = np.nan_to_num(np.minimum(sx, sy), nan=0.0)
+    ref = np.median(sc[inbox[:-1, :-1] & (sc > 0)]) if (inbox[:-1, :-1] & (sc > 0)).any() else 0.0
+    if ref > 0:
+        ok = cv2.resize((sc >= 0.4 * ref).astype(np.uint8), prev.shape[::-1], interpolation=cv2.INTER_NEAREST)
+        valid = ((valid > 0) & (ok > 0)).astype(np.uint8)
+    blobs, ink = content_blobs(prev, region, spacing * scale, min_thick=1.0, min_size=1.0, valid=valid)
+    on = (blobs > 0) & (ink > 0)
+    if on.sum() < 50:
+        return extent, None
+    ys, xs = np.nonzero(on)
+    bx0, bx1 = big[0] + xs.min() / ppu, big[0] + (xs.max() + 1) / ppu
+    by0, by1 = big[2] + ys.min() / ppu, big[2] + (ys.max() + 1) / ppu
+    m = margin * (bx1 - bx0)
+    box = (min(x0, bx0 - m), max(x1, bx1 + m), min(y0, by0 - m), max(y1, by1 + m))
+    # outline of the content (ink closed over each blob) in output pixels of box
+    k = max(5, int(round(1.2 * spacing * scale))) | 1
+    solid = cv2.erode(blobs, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    solid[on] = 255
+    cnts, _ = cv2.findContours(solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    pts = np.concatenate([c.reshape(-1, 2) for c in cnts]).astype(float)
+    pts = (pts / ppu + [big[0] - box[0], big[2] - box[2]]) * model.unit
+    return box, pts
 
 
 def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=False):
@@ -125,9 +214,9 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
     bm = BackwardMap.from_homography(Hc, size)
     cur = I1
     stages["structures_coarse"] = S1.summary()
-    paper_src = None
+    paper_src = keep_pts = None
     model = GCSModel((W0, H0), focal=cfg.focal_scale * max(W0, H0))
-    n = model.build(S1, Hc, weights=cfg.weights)
+    n = model.build(S1, Hc, weights=cfg.weights, ends_mode=cfg.gcs_ends)
     stages["surface_observations"] = int(n)
     if n >= 20:
         model.fit(**(cfg.fit_kw or {}))
@@ -166,12 +255,16 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
         if mask is not None and stages.get("mask_holds_structures", 0) >= 0.97:
             paper_src = mask
         extent = model.page_extent(mask, edges=good) if cfg.full_page else model.content_extent()
+        pts = None
+        if cfg.ink_extent:
+            extent, pts = grow_to_content(model, img, extent, S1.spacing_est)
         bm2 = model.backward_map(extent)
         W2, H2 = bm2.out_size
         finite = np.isfinite(bm2.grid).all(-1).mean()
         if 0.3 < W2 / size[0] < 3 and 0.2 < H2 / size[1] < 4 and finite > 0.9:
             bm = bm2
             cur = bm.apply(img, value=255)
+            keep_pts = pts
         else:
             stages["surface_rejected"] = True
     else:
@@ -186,10 +279,54 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
     if cfg.residual == "none":
         legacy = replace(legacy, use_field=False)
     res = _finish(img, cur, bm, legacy, stages, T, t0, verbose, local_lines=cfg.local_lines,
-                  merge_rows=cfg.merge_rows)
+                  merge_rows=cfg.merge_rows, keep_pts=keep_pts if cfg.ink_extent else None,
+                  margin=cfg.margin if cfg.ink_extent else 0.0, stem_refine=cfg.stem_refine)
+    if cfg.rectify_margins:
+        res = rectify_margins(img, res, cfg)
+    ms = margin_stats(res.structures)
+    if ms is not None:   # diagnostics: slant of the staves' left / right ends, width change top -> bottom
+        res.stages["margins"] = {"left_deg": ms["left"][2], "right_deg": ms["right"][2], "keystone": ms["keystone"]}
     if paper_src is not None:
         res.paper = (res.bmap.apply(paper_src, interp=cv2.INTER_LINEAR, value=0) > 127).astype(np.uint8) * 255
     return res
+
+
+def rectify_margins(img, res, cfg):
+    """Map the text block onto a rectangle (Stamatopoulos et al. 2011, the
+    boundary terms of Jiang et al. CVPR 2022): fit lines through the staves'
+    left ends and right ends of the corrected page and stretch every row
+    linearly so that both become vertical, at the width of the middle row.
+    A justified score has its clefs and final barlines on two vertical lines;
+    a residual slant (shear) or a width change from top to bottom (keystone)
+    left by the surface + field shows there first. Skipped when the margins
+    rest on few rows or the correction would be large (a misread margin)."""
+    ms = margin_stats(res.structures, min_rows=cfg.rect_min_rows)
+    st = res.stages
+    if ms is None:
+        st["rectify_margins"] = "skipped: few rows"
+        return res
+    if max(abs(ms["left"][2]), abs(ms["right"][2])) > cfg.rect_max_deg or abs(ms["keystone"]) > cfg.rect_max_kst:
+        st["rectify_margins"] = "skipped: large"
+        return res
+    (kL, cL), (kR, cR) = ms["lines"]["left"], ms["lines"]["right"]
+    ym = 0.5 * sum(ms["y"])
+    Lm, Rm = cL + kL * ym, cR + kR * ym
+
+    def back(q):   # rectified output -> current output
+        L, R = cL + kL * q[:, 1], cR + kR * q[:, 1]
+        return np.stack([L + (q[:, 0] - Lm) * (R - L) / (Rm - Lm), q[:, 1]], 1)
+
+    bm = res.bmap.compose(BackwardMap.from_function(back, res.bmap.out_size, stride=res.bmap.stride))
+    image = bm.apply(img, value=255)
+    content = res.content
+    if content is not None and len(content):
+        c = np.asarray(content, float)
+        L, R = cL + kL * c[:, 1], cR + kR * c[:, 1]
+        content = np.stack([Lm + (c[:, 0] - L) * (Rm - Lm) / (R - L), c[:, 1]], 1)
+    norm, _, S = _detect(image, merge_rows=cfg.merge_rows, stem_refine=cfg.stem_refine)
+    st["rectify_margins"] = {"left_deg": ms["left"][2], "right_deg": ms["right"][2], "keystone": ms["keystone"]}
+    return replace(res, image=image, enhanced=norm, bmap=bm, structures=S,
+                   page_type=S.page_type, content=content)
 
 
 BENCH_METHODS = {

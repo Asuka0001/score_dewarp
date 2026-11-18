@@ -69,6 +69,13 @@ class BackwardMap:
         src[np.isnan(g).any(1)] = np.nan
         return BackwardMap(src.reshape(after.grid.shape), after.stride, after.out_size)
 
+    def pad(self, left=0, top=0, right=0, bottom=0) -> "BackwardMap":
+        """Grow the output canvas; new pixels map nowhere (rendered as fill)."""
+        W, H = self.out_size
+        size = (W + int(left) + int(right), H + int(top) + int(bottom))
+        shift = BackwardMap.from_function(lambda q: q - [int(left), int(top)], size, self.stride)
+        return self.compose(shift)
+
     def forward_points(self, pts):
         """source -> output coordinates (NaN when outside the mapped area)."""
         if self._inv is None:
@@ -80,6 +87,31 @@ class BackwardMap:
             self._inv = LinearNDInterpolator(src[ok], out[ok])
         pts = np.asarray(pts, float).reshape(-1, 2)
         return self._inv(pts)
+
+
+def photo_footprint(src_pts, photo_size, gap, scale=0.25):
+    """Photo area covered by a mapped region, as a test ``inside(pts) -> bool``.
+
+    ``src_pts``: photo coords of the region's grid nodes; ``gap``: their
+    spacing in photo pixels (holes up to it are closed). Used to keep an
+    extrapolated surface from showing photo pixels a second time where it
+    runs back over the page (past a fold)."""
+    W0, H0 = photo_size
+    foot = np.zeros((int(H0 * scale) + 1, int(W0 * scale) + 1), np.uint8)
+    q = np.round(np.asarray(src_pts, float).reshape(-1, 2) * scale)
+    q = q[np.isfinite(q).all(1)].astype(int)
+    q = q[(q[:, 0] >= 0) & (q[:, 0] < foot.shape[1]) & (q[:, 1] >= 0) & (q[:, 1] < foot.shape[0])]
+    foot[q[:, 1], q[:, 0]] = 1
+    k = 2 * (int(np.ceil(gap * scale)) + 1) + 1
+    foot = cv2.morphologyEx(foot, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+
+    def inside(pts):
+        p = np.round(np.nan_to_num(np.asarray(pts, float), nan=-1) * scale).astype(int)
+        ok = (p[..., 0] >= 0) & (p[..., 0] < foot.shape[1]) & (p[..., 1] >= 0) & (p[..., 1] < foot.shape[0])
+        out = np.zeros(p.shape[:-1], bool)
+        out[ok] = foot[p[ok][:, 1], p[ok][:, 0]] > 0
+        return out
+    return inside
 
 
 def mapping_quality(bmap, photo_size):

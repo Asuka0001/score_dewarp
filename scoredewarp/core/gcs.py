@@ -49,6 +49,23 @@ def _subsample(pts, min_d):
     return pts[keep]
 
 
+def _staff_rows(staves):
+    """Row id per staff: staves at the same height (one staff split into
+    pieces by the detector) share a row."""
+    if not staves:
+        return []
+    mid = np.array([np.median([t[2, 1] for t in st.tuples]) if len(st.tuples) else np.nan for st in staves])
+    sp = np.array([st.spacing for st in staves])
+    order = np.argsort(np.nan_to_num(mid, nan=1e9))
+    row, cur, last = [0] * len(staves), -1, None
+    for i in order:
+        if last is None or not np.isfinite(mid[i]) or abs(mid[i] - last) > 2.0 * sp[i]:
+            cur += 1
+            last = mid[i]
+        row[i] = cur
+    return row
+
+
 class GCSModel:
     def __init__(self, img_size, focal=None):
         W0, H0 = img_size
@@ -58,7 +75,11 @@ class GCSModel:
         self.K = np.array([[self.f, 0, self.c[0]], [0, self.f, self.c[1]], [0, 0, 1]])
 
     # ------------------------------------------------------------ build --
-    def build(self, S: Structures, H_coarse: np.ndarray, weights=None):
+    def build(self, S: Structures, H_coarse: np.ndarray, weights=None, ends_mode="all"):
+        """``ends_mode``: "all" takes the first / last point of every fragment of
+        the outer staff lines as a system end (also where a broken line merely
+        resumes); "rows" only the outermost ends of each staff row (staves the
+        detector split into pieces at the same height are one row)."""
         w_type = {"staff": 1.0, "hline": 0.5, "jianpu": 0.8, "text": 0.5, "vseg": 0.6, "ends": 0.5}
         w_type.update(weights or {})
         Hinv = np.linalg.inv(H_coarse)
@@ -77,7 +98,9 @@ class GCSModel:
 
         sp_unit = max(S.spacing_est, 4.0)
         staff_s, ends = [], {"L": [], "R": []}
-        for st in S.staves:
+        row_of = _staff_rows(S.staves) if ends_mode == "rows" else None
+        row_ends = {}
+        for k, st in enumerate(S.staves):
             y_top = np.median([t[0, 1] for t in st.tuples])
             iY, iS = new(y_top / W1), new(st.spacing / W1)
             staff_s.append(iS)
@@ -88,9 +111,19 @@ class GCSModel:
             # end points of the system (outer lines only, where they were traced)
             for fi in st.frag_ids:
                 f = S.fragments[fi]
-                if f.line in (0, 4):
+                if f.line not in (0, 4):
+                    continue
+                if row_of is None:
                     ends["L"].append((f.pts[0], iY, iS, float(f.line)))
                     ends["R"].append((f.pts[-1], iY, iS, float(f.line)))
+                    continue
+                for side, p, better in (("L", f.pts[0], lambda a, b: a[0] < b[0]),
+                                        ("R", f.pts[-1], lambda a, b: a[0] > b[0])):
+                    key = (row_of[k], side, f.line)
+                    if key not in row_ends or better(p, row_ends[key][0]):
+                        row_ends[key] = (p, iY, iS, float(f.line))
+        for (_, side, _), e in row_ends.items():
+            ends[side].append(e)
         self.staff_s = staff_s
         if len(S.staves) >= 3:
             for side in ("L", "R"):
