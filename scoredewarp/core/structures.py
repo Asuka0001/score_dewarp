@@ -664,8 +664,73 @@ def _learned_staves(seg, ink, thick, W, robust):
     return sfr, staves
 
 
+def _staff_mid(st, xs):
+    return 0.5 * (np.polyval(st.top_poly, xs) + np.polyval(st.bot_poly, xs))
+
+
+def _same_staff(a, b):
+    lo, hi = max(a.x_range[0], b.x_range[0]), min(a.x_range[1], b.x_range[1])
+    if hi <= lo:
+        return False
+    xs = np.linspace(lo, hi, 9)
+    return float(np.median(np.abs(_staff_mid(a, xs) - _staff_mid(b, xs)))) < 1.5 * min(a.spacing, b.spacing)
+
+
+def _fuse_staves(cf, cs, lf, ls, prefer=1.3):
+    """Per-staff fusion of classical (``cf``, ``cs``) and learned (``lf``,
+    ``ls``) staves (fragments, staves); returns (fragments, staves, the kept
+    learned staves).
+
+    The network misses whole staves on low-resolution pages and loses pieces
+    of a staff at strong curl; morphology misses grey staves under shading and
+    breaks lines at dense notation. Learned staves are the base; a classical
+    staff no learned staff overlaps is added (its line pieces had been free
+    fragments of the learned path), and one that covers ``prefer`` times the
+    line length of the learned staves it overlaps replaces them. Fragment
+    indices are kept stable (removed pieces become 1-point placeholders)."""
+    cov = lambda fr, st: sum(float(np.ptp(fr[i].pts[:, 0])) for i in st.frag_ids)
+    frags = [Fragment(f.pts, f.staff, f.line) for f in lf]
+    keep = [True] * len(ls)
+    added = []
+    for c in cs:
+        m = [k for k, l_ in enumerate(ls) if keep[k] and _same_staff(c, l_)]
+        if m and cov(cf, c) <= prefer * sum(cov(lf, ls[k]) for k in m):
+            continue
+        for k in m:
+            keep[k] = False
+            for fi in ls[k].frag_ids:
+                frags[fi] = Fragment(frags[fi].pts[:1])
+        # free pieces inside this staff's band are its own lines seen as free lines
+        xs0, xs1 = c.x_range
+        for fi, f in enumerate(frags):
+            if f.staff >= 0 or len(f.pts) < 2:
+                continue
+            q = f.pts[len(f.pts) // 2]
+            if xs0 - c.spacing <= q[0] <= xs1 + c.spacing:
+                top = np.polyval(c.top_poly, q[0]) - 1.5 * c.spacing
+                bot = np.polyval(c.bot_poly, q[0]) + 1.5 * c.spacing
+                if top <= q[1] <= bot:
+                    frags[fi] = Fragment(f.pts[:1])
+        ids = []
+        for fi in c.frag_ids:
+            g = cf[fi]
+            frags.append(Fragment(g.pts, -1, g.line))
+            ids.append(len(frags) - 1)
+        added.append(Staff(frag_ids=ids, tuples=c.tuples, spacing=c.spacing, top_poly=c.top_poly,
+                           bot_poly=c.bot_poly, x_range=c.x_range))
+    kept = [Staff(frag_ids=list(l_.frag_ids), tuples=l_.tuples, spacing=l_.spacing, top_poly=l_.top_poly,
+                  bot_poly=l_.bot_poly, x_range=l_.x_range) for k, l_ in enumerate(ls) if keep[k]]
+    staves = sorted(kept + added, key=lambda s_: np.polyval(s_.top_poly, np.mean(s_.x_range)))
+    for f in frags:
+        f.staff = -1
+    for k, st in enumerate(staves):
+        for fi in st.frag_ids:
+            frags[fi].staff = k
+    return frags, staves, kept
+
+
 def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_lines=False,
-                      merge_rows=False, stem_refine=False, seg=None) -> Structures:
+                      merge_rows=False, stem_refine=False, seg=None, valid=None, fuse="page") -> Structures:
     """Detect exported structures; ``robust=False`` preserves optimizer evidence.
 
     Recovered faint/broken lines are useful for page type and annotations, but
@@ -681,8 +746,14 @@ def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_l
     ``seg``: optional learned masks (``learned.masks``) on this image; staff
     lines then come from the staff mask and strokes inside staff bands from
     the stem mask (see ``_learned_staves``).
+    ``valid``: optional 0/1 sheet mask; ink and learned masks off the sheet
+    are ignored (``ink`` is expected to be masked already).
     """
     H, W = ink.shape
+    if valid is not None:
+        ink = ink & valid
+        if seg is not None:
+            seg = {k: v & valid for k, v in seg.items()}
     thick, sp = run_metrics(ink)
     frags_pts, hmask = find_fragments(ink, thick, sp if sp else 12, horizontal=True)
     frags = [Fragment(p) for p in frags_pts]
@@ -692,6 +763,8 @@ def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_l
         block = max(15, min(H, W) // 50) | 1
         local_ink = cv2.adaptiveThreshold(norm, 1, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                           cv2.THRESH_BINARY_INV, block, 5)
+        if valid is not None:
+            local_ink &= valid
         local_thick, local_sp = run_metrics(local_ink)
         local_frags = [Fragment(p) for p in find_fragments(local_ink, local_thick, local_sp or 12)[0]]
         local_staves = group_staves(local_frags, W, local_sp or None, bridge_gaps=robust)
@@ -705,6 +778,8 @@ def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_l
         block = max(15, min(H, W) // 50) | 1
         local_ink = cv2.adaptiveThreshold(norm, 1, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                         cv2.THRESH_BINARY_INV, block, 5)
+        if valid is not None:
+            local_ink &= valid
         local_thick, local_sp = run_metrics(local_ink)
         local_pts, _ = find_fragments(local_ink, local_thick, local_sp or 12)
         local_frags = [Fragment(p) for p in local_pts]
@@ -715,13 +790,20 @@ def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_l
     # learned staff mask: kept when it covers at least as much staff-line
     # length as the classical evidence (dev 2026-11-18: the mask alone lost whole staves
     # on low-resolution pages, recall 0.77 vs 0.88; positions equally accurate)
-    learned = _learned_staves(seg, ink, thick, W, robust) if seg is not None else None
+    # per-staff fusion: the network's clean mask is safe to bridge across
+    # symbols / barlines (otherwise it splits a row into pieces at dense notation)
+    learned = _learned_staves(seg, ink, thick, W, robust or fuse == "staff") if seg is not None else None
     # compare covered staff-line length, not fragment counts (the mask breaks
     # lines into more pieces at noteheads)
     cover = lambda fr, st: sum(float(np.ptp(fr[i].pts[:, 0])) for s_ in st for i in s_.frag_ids)
-    use_learned = learned is not None and cover(*learned) >= cover(frags, staves)
-    if use_learned:
-        frags, staves = learned
+    stem_staves = None
+    if fuse == "staff" and learned is not None:
+        frags, staves, stem_staves = _fuse_staves(frags, staves, *learned)
+        use_learned = bool(stem_staves)
+    else:
+        use_learned = learned is not None and cover(*learned) >= cover(frags, staves)
+        if use_learned:
+            frags, staves = learned
     if staves:
         sp = float(np.median([s.spacing for s in staves]))
     band = staff_band_mask(ink.shape, staves)
@@ -748,7 +830,8 @@ def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_l
         # to a vertical run, so it bridges stems without creating verticals).
         bridge = seg.get("staff", seg.get("_staff_bridge"))
         stems = seg["stem"] | bridge if bridge is not None else seg["stem"]
-        vink = np.where(band > 0, stems, ink).astype(np.uint8)
+        sband = band if stem_staves is None else staff_band_mask(ink.shape, stem_staves)
+        vink = np.where(sband > 0, stems, ink).astype(np.uint8)
     vpts, _ = find_fragments(vink, thick, sp, horizontal=False, length=Lv)
     if stem_refine and staves:
         # the bias comes from noteheads / flags, so only pages with staves.

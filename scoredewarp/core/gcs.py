@@ -125,6 +125,20 @@ class GCSModel:
         for (_, side, _), e in row_ends.items():
             ends[side].append(e)
         self.staff_s = staff_s
+        # photo points of the staff block, for the margin check of a solution
+        # (margin_score): per staff row its line pieces, sampled
+        rows = _staff_rows(S.staves)
+        self.block = []
+        for k, st in enumerate(S.staves):
+            lines = {}
+            for fi in st.frag_ids:
+                f = S.fragments[fi]
+                if f.line >= 0 and len(f.pts) >= 2:
+                    q = _subsample(f.pts, 1.5 * st.spacing)
+                    q = cv2.perspectiveTransform(q.reshape(-1, 1, 2).astype(float), Hinv).reshape(-1, 2)
+                    lines.setdefault(f.line, []).append(q)
+            if lines:
+                self.block.append((rows[k], {ln: np.concatenate(v) for ln, v in lines.items()}))
         if len(S.staves) >= 3:
             for side in ("L", "R"):
                 xs = [e[0][0] for e in ends[side]]
@@ -280,6 +294,7 @@ class GCSModel:
         self.rms0 = float(np.sqrt(np.mean(r0[:n] ** 2)))
         best = None
         self.fit_candidates = []
+        self.solutions = []          # (phi_deg, params, cost) of every finished start
         sp = self.sparsity()
         kw = dict(jac_sparsity=sp, method="trf", loss="soft_l1", f_scale=3.0, x_scale="jac")
         if warm:
@@ -292,6 +307,7 @@ class GCSModel:
                 short_cost = float(res.cost)
                 if finish_all:
                     res = least_squares(self.residuals, res.x, max_nfev=max_nfev, **kw)
+                    self.solutions.append((float(np.degrees(phi)), res.x.copy(), float(res.cost)))
                 self.fit_candidates.append({"phi_deg": float(np.degrees(phi)),
                                             "short_cost": short_cost, "cost": float(res.cost),
                                             "finished": bool(finish_all)})
@@ -308,6 +324,140 @@ class GCSModel:
         self.err_p90 = float(np.percentile(e, 90))
         self.cost = float(best.cost)
         return best
+
+    def outline_score(self, q, trim=0.15, min_pts=15):
+        """How far the sheet outline ``q`` (photo points of the paper border,
+        e.g. from a learned sheet mask) is from an axis-aligned rectangle on the
+        flat page of the current solution: per side, the median absolute
+        deviation of the across-side coordinate over the central part of the
+        side (corners trimmed: curled corners, mask rounding), averaged over
+        the sides and divided by the content size. A wrong perspective /
+        ruling solution leaves slanted or bent sides; returns NaN with fewer
+        than two usable sides."""
+        X, Y = self.flat_coords(np.asarray(q, float))
+        ok = np.isfinite(X) & np.isfinite(Y)
+        X, Y = X[ok], Y[ok]
+        x0, x1, y0, y1 = self.content_extent(0.0)
+        cx, cy, w, h = 0.5 * (x0 + x1), 0.5 * (y0 + y1), max(x1 - x0, 1e-9), max(y1 - y0, 1e-9)
+        u, v = (X - cx) / w, (Y - cy) / h
+        horiz = np.abs(v) >= np.abs(u)              # top / bottom sides
+        devs = []
+        for m, across, along in ((horiz & (v < 0), Y, X), (horiz & (v > 0), Y, X),
+                                 (~horiz & (u < 0), X, Y), (~horiz & (u > 0), X, Y)):
+            if m.sum() < min_pts:
+                continue
+            a, t = across[m], along[m]
+            lo, hi = np.percentile(t, [100 * trim, 100 * (1 - trim)])
+            k = (t >= lo) & (t <= hi)
+            if k.sum() < min_pts:
+                continue
+            devs.append(float(np.median(np.abs(a[k] - np.median(a[k])))))
+        return float(np.mean(devs) / max(w, h)) if len(devs) >= 2 else float("nan")
+
+    def margin_score(self, q, trim=0.15, min_pts=15, reject=1.5):
+        """How far the page margins of the current solution are from constant:
+        on the flat page the sheet outline ``q`` must run parallel to the staff
+        block at a fixed distance -- left / right border vs the line through
+        the staff rows' left / right ends, top / bottom border vs the top line
+        of the first and the bottom line of the last staff. Per side the median
+        absolute deviation of (border - staff block line) over the central part
+        of the side, averaged over the sides, divided by the content size; NaN
+        without a staff block or with fewer than two usable sides. Unlike
+        ``outline_score`` this ties the weak, possibly curled border to the
+        strong staff evidence: a wrong solution bends the margins, where the
+        surface is extrapolated, differently from the staff block."""
+        from scipy.stats import theilslopes
+        if not getattr(self, "block", None):
+            return float("nan")
+        X, Y = self.flat_coords(np.asarray(q, float))
+        ok = np.isfinite(X) & np.isfinite(Y)
+        X, Y = X[ok], Y[ok]
+        x0, x1, y0, y1 = self.content_extent(0.0)
+        cx, cy, w, h = 0.5 * (x0 + x1), 0.5 * (y0 + y1), max(x1 - x0, 1e-9), max(y1 - y0, 1e-9)
+        u, v = (X - cx) / w, (Y - cy) / h
+        horiz = np.abs(v) >= np.abs(u)
+        # staff block in the flat page of this solution
+        rows = {}
+        for r, lines in self.block:
+            for ln, pts in lines.items():
+                bx, by = self.flat_coords(pts)
+                good = np.isfinite(bx) & np.isfinite(by)
+                if good.sum() >= 2:
+                    rows.setdefault(r, {}).setdefault(ln, []).append(np.stack([bx[good], by[good]], 1))
+        rows = {r: {ln: np.concatenate(v) for ln, v in d.items()} for r, d in rows.items()}
+        if not rows:
+            return float("nan")
+        sp = float(np.median([np.median(np.diff(sorted(np.median(p[:, 1]) for p in d.values())))
+                              for d in rows.values() if len(d) >= 2] or [0.01 * h]))
+        devs = []
+
+        def side(mask, across, along, ref, lo, hi):
+            if mask.sum() < min_pts:
+                return
+            a, t = across[mask], along[mask]
+            tl, th = np.percentile(t, [100 * trim, 100 * (1 - trim)])
+            k = (t >= max(tl, lo)) & (t <= min(th, hi))
+            if k.sum() < min_pts:
+                return
+            m = a[k] - ref(t[k])
+            devs.append(float(np.median(np.abs(m - np.median(m)))))
+
+        # left / right: line through the rows' end points (median over the lines of a row)
+        for sgn, sel in ((-1, horiz == 0), (1, horiz == 0)):
+            ends = []
+            for d in rows.values():
+                xs = [p[:, 0].min() if sgn < 0 else p[:, 0].max() for p in d.values() if len(p)]
+                ys = [np.median(p[:, 1]) for p in d.values() if len(p)]
+                if len(xs) >= 3:
+                    ends.append((float(np.median(xs)), float(np.median(ys))))
+            if len(ends) < 3:
+                continue
+            E = np.array(ends)
+            b, a = theilslopes(E[:, 0], E[:, 1])[:2]
+            keep = np.abs(E[:, 0] - (a + b * E[:, 1])) < reject * sp
+            if keep.sum() < 3:
+                continue
+            b, a = np.polyfit(E[keep, 1], E[keep, 0], 1)
+            m = sel & ((u < 0) if sgn < 0 else (u > 0))
+            side(m, X, Y, lambda t, a=a, b=b: a + b * t, E[:, 1].min() - 0.1 * h, E[:, 1].max() + 0.1 * h)
+        # top / bottom: outer line of the first / last staff row
+        order = sorted(rows, key=lambda r: np.median(np.concatenate(list(rows[r].values()))[:, 1]))
+        for r, ln, m in ((order[0], 0, horiz & (v < 0)), (order[-1], 4, horiz & (v > 0))):
+            if ln not in rows[r] or len(rows[r][ln]) < 4:
+                continue
+            P = rows[r][ln]
+            c1, c0 = np.polyfit(P[:, 0], P[:, 1], 1)
+            side(m, Y, X, lambda t, c0=c0, c1=c1: c0 + c1 * t, P[:, 0].min(), P[:, 0].max())
+        return float(np.mean(devs) / max(w, h)) if len(devs) >= 2 else float("nan")
+
+    def select_by_outline(self, q, cost_ratio=1.5, margin=False):
+        """Among the finished starts with a cost within ``cost_ratio`` of the
+        best, take the one whose sheet outline is most rectangular
+        (``outline_score``). Returns diagnostics; keeps the lowest cost when no
+        outline score is available."""
+        if len(getattr(self, "solutions", [])) < 2:
+            return None
+        best_cost = min(c for _, _, c in self.solutions)
+        p_keep = self.p
+        info = []
+        for phi, x, c in self.solutions:
+            self.p = x
+            sc = self.outline_score(q) if c <= cost_ratio * best_cost else float("nan")
+            d = {"phi_deg": phi, "cost": c, "outline": sc}
+            if margin and np.isfinite(sc):
+                mg = self.margin_score(q)
+                d["margin"] = mg
+                if np.isfinite(mg):
+                    d["outline"] = sc + mg
+            info.append(d)
+        ok = [i for i, d in enumerate(info) if np.isfinite(d["outline"])]
+        if not ok:
+            self.p = p_keep
+            return {"candidates": info, "selected": None}
+        k = min(ok, key=lambda i: info[i]["outline"])
+        self.p = self.solutions[k][1]
+        self.cost = self.solutions[k][2]
+        return {"candidates": info, "selected": k}
 
     # ------------------------------------------------------------- edges --
     def flat_coords(self, q, iters=6):
@@ -458,13 +608,17 @@ class GCSModel:
         m = margin * (x1 - x0)
         return x0 - m, x1 + m, y0 - m, y1 + m
 
-    def page_extent(self, page_mask=None, grow=0.35, margin=0.01, edges=(), edge_margin=0.015):
+    def page_extent(self, page_mask=None, grow=0.35, margin=0.01, edges=(), edge_margin=0.015, fold_check=False):
         """Flat box of all page points visible in the photo (inside the page
         mask when given), limited to the content box grown by ``grow``.
 
         Sides listed in ``edges`` (fitted paper borders, see ``add_edges``) are
-        taken from the border itself instead, without the ``grow`` limit."""
-        box = self._visible_extent(page_mask, grow, margin)
+        taken from the border itself instead, without the ``grow`` limit.
+        ``fold_check``: only flat points the surface maps to the photo with the
+        content's orientation and without collapse, connected to the content
+        box: past a fold of the fitted surface (a curled edge the slope profile
+        overshoots) the photo is seen a second time, mirrored."""
+        box = self._visible_extent(page_mask, grow, margin, fold_check)
         if not edges:
             return box
         x0, x1, y0, y1 = box
@@ -479,7 +633,7 @@ class GCSModel:
             return box
         return x0, x1, y0, y1
 
-    def _visible_extent(self, page_mask, grow, margin):
+    def _visible_extent(self, page_mask, grow, margin, fold_check=False):
         x0, x1, y0, y1 = self.content_extent(0.0)
         gx, gy = (x1 - x0) * grow, (y1 - y0) * grow
         bx0, bx1, by0, by1 = x0 - gx, x1 + gx, y0 - gy, y1 + gy
@@ -487,6 +641,8 @@ class GCSModel:
         q = self.project(self.p, Xg.ravel(), Yg.ravel())
         W0, H0 = self.img_size
         ok = np.isfinite(q).all(1) & (q[:, 0] >= 0) & (q[:, 0] < W0 - 1) & (q[:, 1] >= 0) & (q[:, 1] < H0 - 1)
+        if fold_check:
+            ok &= self._unfolded(q.reshape(200, 160, 2), Xg, Yg, (x0, x1, y0, y1)).ravel()
         if page_mask is not None and ok.any():
             qi = np.round(q[ok]).astype(int)
             inside = page_mask[qi[:, 1], qi[:, 0]] > 0
@@ -501,6 +657,30 @@ class GCSModel:
               min(np.percentile(Y, 0.2), y0), max(np.percentile(Y, 99.8), y1))
         m = margin * (ex[1] - ex[0])
         return ex[0] - m, ex[1] + m, ex[2] - m, ex[3] + m
+
+    @staticmethod
+    def _unfolded(q, Xg, Yg, box, min_rel=0.1):
+        """(h, w) bool on a flat grid: the projection keeps the orientation of
+        the content box, its Jacobian determinant is at least ``min_rel`` of
+        the content's median, and the point is connected to the content box."""
+        from scipy import ndimage
+        with np.errstate(invalid="ignore"):
+            qx_X = np.gradient(q[..., 0], axis=1)
+            qy_X = np.gradient(q[..., 1], axis=1)
+            qx_Y = np.gradient(q[..., 0], axis=0)
+            qy_Y = np.gradient(q[..., 1], axis=0)
+            det = qx_X * qy_Y - qx_Y * qy_X
+        x0, x1, y0, y1 = box
+        inbox = (Xg >= x0) & (Xg <= x1) & (Yg >= y0) & (Yg <= y1)
+        ref = det[inbox & np.isfinite(det)]
+        if not len(ref):
+            return np.ones(det.shape, bool)
+        ref = float(np.median(ref))
+        good = np.nan_to_num(det * np.sign(ref), nan=-1.0) > min_rel * abs(ref)
+        lab, n = ndimage.label(good)
+        keep = np.unique(lab[inbox & good])
+        keep = keep[keep > 0]
+        return np.isin(lab, keep) if len(keep) else good
 
     def backward_map(self, extent, out_scale=1.0, stride=4):
         x0, x1, y0, y1 = extent

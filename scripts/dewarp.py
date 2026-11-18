@@ -27,7 +27,7 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from scoredewarp.core.metric_pipeline import MetricConfig, dewarp_metric  # noqa: E402
+from scoredewarp.core.metric_pipeline import MODEL_PRESETS, MetricConfig, dewarp_metric  # noqa: E402
 from scoredewarp.core.pipeline import Config, dewarp, result_json  # noqa: E402
 from scoredewarp.core.preprocess import clean_page, paper_region  # noqa: E402
 from scoredewarp.core.structures import draw_structures  # noqa: E402
@@ -48,6 +48,10 @@ def main():
     ap.add_argument("--seg", choices=("off", "homr"), default="off",
                     help="metric: learned staff-line / stem segmentation (needs onnxruntime and "
                          "scripts/download_models.py)")
+    ap.add_argument("--models", choices=tuple(MODEL_PRESETS), default="off",
+                    help="metric: small detection models (geometry stays the solver): page = U2-Netp sheet "
+                         "segmentation (sheet mask, page quad, surface selection by the sheet outline); "
+                         "all = page + homr staff lines. Weights in models/")
     ap.add_argument("--crop-content", action="store_true",
                     help="metric: output only the detected content box instead of the whole page")
     ap.add_argument("--binary", action="store_true", help="also write a black/white reading copy")
@@ -77,8 +81,11 @@ def main():
         if os.path.basename(path) == "photo.jpg":  # benchmark / synthetic folders
             name = os.path.basename(os.path.dirname(os.path.abspath(path)))
         if args.method == "metric":
-            cfg = MetricConfig(residual="none" if args.no_field else MetricConfig.residual,
-                               full_page=not args.crop_content, seg=args.seg, output_res=args.output_res)
+            preset = dict(MODEL_PRESETS[args.models])
+            if args.seg != "off":
+                preset["seg"] = args.seg
+            cfg = MetricConfig(**{**preset, "residual": "none" if args.no_field else MetricConfig.residual,
+                                  "full_page": not args.crop_content, "output_res": args.output_res})
             res = dewarp_metric(img, cfg)
         else:
             res = dewarp(img, Config(use_field=not args.no_field))

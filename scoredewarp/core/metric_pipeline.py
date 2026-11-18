@@ -19,7 +19,7 @@ from .field import margin_stats
 from .gcs import GCSModel
 from .page import (detect_page_quad, estimate_skew, page_edges, page_mask, quad_homography, refine_page_mask,
                    rotation_homography)
-from .pipeline import Config, _detect, _finish, _warp_seg
+from .pipeline import Config, _detect, _finish, _warp_mask, _warp_seg
 from .preprocess import binarize, content_blobs, normalize_illumination, to_gray
 from .structures import scale_structures
 from .transforms import BackwardMap, native_scale, photo_footprint
@@ -80,6 +80,21 @@ class MetricConfig:
     seg: str = "off"                 # off | homr: learned staff-line / stem masks replace morphology (core/learned.py)
     seg_parts: str | None = None     # e.g. staff / stem / staff+stem; None also honours SEG_PARTS env
     stem_bridge: bool = True         # preserve staff crossings in the stem-only ablation
+    seg_fuse: str = "page"           # page: learned or classical staves per page (by line length) | staff: per staff
+    seg_stages: str = "bcf"          # where the learned masks are used: b surface fit, c residual field, f final output
+    page_seg: str = "off"            # off | u2netp: learned sheet mask, evidence only on the sheet (core/pagenet.py)
+    page_erode: float = 0.01         # sheet mask eroded by this fraction of the photo width (paper rim, shadow edge)
+    page_seg_extent: bool = False    # also use the learned sheet mask in place of the brightness mask for the extent
+    page_quad: bool = False          # with page_seg: page quad from the learned mask when the brightness quad fails
+    page_select: bool = True         # with page_seg: drop the facing page of a two-page spread (pagenet.spread_cut)
+    extent_fold: bool = False        # the output extent stops where the fitted surface folds over (GCSModel._unfolded)
+    edge_prefit: bool = False        # with a learned sheet mask: its four sides are straight-line constraints of B
+    edge_prefit_w: float = 1.0       # from the first fit on (soft_l1: curled stretches act as outliers)
+    sheet_content: bool = True       # with a learned sheet mask: all print on the sheet is content of the output
+    quad_alt: bool = False           # with a learned page quad: also fit without it, keep the more rectangular outline
+    b_select: str = "cost"           # cost | outline | outline_margin: with a learned sheet mask, finish both ruling
+                                     # starts, keep the most rectangular sheet outline (GCSModel.select_by_outline);
+                                     # outline_margin also wants constant page margins to the staff block
     field_iters: int = 3
     fit_kw: dict = None
     weights: dict = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
@@ -95,8 +110,15 @@ def _coarse_homography(img, quad, width):
     return np.diag([sc, sc, 1.0]), (int(W0 * sc), int(H0 * sc))
 
 
-def coarse(img, cfg):
+def coarse(img, cfg, sal=None, stages=None):
+    """``sal``: learned saliency map (``pagenet.saliency``); with
+    ``cfg.page_quad`` its page quadrilateral replaces a missing brightness quad."""
     quad = detect_page_quad(img)
+    if quad is None and sal is not None and cfg.page_quad:
+        from .pagenet import page_quad
+        quad = page_quad(img, sal)
+        if stages is not None:
+            stages["quad_source"] = "pagenet" if quad is not None else None
     Hq, size = _coarse_homography(img, quad, cfg.coarse_width)
     I1 = cv2.warpPerspective(img, Hq, size, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     ang, r90 = estimate_skew(binarize(normalize_illumination(to_gray(I1))))
@@ -106,7 +128,7 @@ def coarse(img, cfg):
     return Hc, size, I1, quad, ang
 
 
-def detect_at_scale(img, Hc, size, I1, cfg, stages, seg_src=None):
+def detect_at_scale(img, Hc, size, I1, cfg, stages, seg_src=None, page_src=None):
     """Detect structures; redo at a larger coarse scale for small staff lines.
 
     The detector works in integer pixels (run lengths >= 6 px). Dense scores
@@ -117,7 +139,8 @@ def detect_at_scale(img, Hc, size, I1, cfg, stages, seg_src=None):
     """
     _, _, S = _detect(I1, robust=cfg.robust_detect, local_lines=cfg.local_lines, merge_rows=cfg.merge_rows,
                       stem_refine=cfg.stem_refine, seg=_warp_seg(BackwardMap.from_homography(Hc, size), seg_src),
-                      seg_parts=cfg.seg_parts, stem_bridge=cfg.stem_bridge)
+                      seg_parts=cfg.seg_parts, stem_bridge=cfg.stem_bridge,
+                      page=_warp_mask(BackwardMap.from_homography(Hc, size), page_src), seg_fuse=cfg.seg_fuse)
     if cfg.adaptive_scale != "off" and S.staves:
         sp = float(np.median([st.spacing for st in S.staves]))
         if sp < 9:
@@ -128,12 +151,13 @@ def detect_at_scale(img, Hc, size, I1, cfg, stages, seg_src=None):
             _, _, S = _detect(I1, robust=cfg.robust_detect, local_lines=cfg.local_lines, merge_rows=cfg.merge_rows,
                               stem_refine=cfg.stem_refine,
                               seg=_warp_seg(BackwardMap.from_homography(Hc, size), seg_src),
-                              seg_parts=cfg.seg_parts, stem_bridge=cfg.stem_bridge)
+                              seg_parts=cfg.seg_parts, stem_bridge=cfg.stem_bridge,
+                              page=_warp_mask(BackwardMap.from_homography(Hc, size), page_src), seg_fuse=cfg.seg_fuse)
             stages["coarse_upscale"] = f
     return Hc, size, I1, S
 
 
-def grow_to_content(model, img, extent, spacing, margin=0.0, look=0.15, scale=0.5):
+def grow_to_content(model, img, extent, spacing, margin=0.0, look=0.15, scale=0.5, sheet=None):
     """Grow the flat output box over all printed content on the sheet.
 
     The surface is fitted to staff lines / rows / strokes, and the page box is
@@ -146,6 +170,9 @@ def grow_to_content(model, img, extent, spacing, margin=0.0, look=0.15, scale=0.
     residual (``_finish``), so it calls this with ``margin=0``.
     Returns (box, outline points of the content in the output pixels of the
     returned box, or None).
+    ``sheet``: learned sheet mask on the photo; ink on it counts as content
+    even outside the box (a page number in a curled corner that the fitted
+    border line cuts off).
     """
     x0, x1, y0, y1 = extent
     gx, gy = look * (x1 - x0), look * (y1 - y0)
@@ -171,6 +198,10 @@ def grow_to_content(model, img, extent, spacing, margin=0.0, look=0.15, scale=0.
     bad = (~inbox & dup).astype(np.uint8)
     bad = cv2.resize(bad, prev.shape[::-1], interpolation=cv2.INTER_NEAREST) > 0
     prev[bad & (region == 0)] = 255
+    if sheet is not None:
+        sh = cv2.resize(sheet, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else sheet
+        on = BackwardMap(bmp.grid * f, bmp.stride, bmp.out_size).apply(sh, interp=cv2.INTER_LINEAR, value=0) > 127
+        region = np.where(on & ~bad, 255, region).astype(np.uint8)
     # off the photo the preview is white; the shading flattening turns the
     # dark background next to it into a false ink line -> ignore that rim
     inph = BackwardMap(bmp.grid, bmp.stride, bmp.out_size).full_maps()
@@ -205,12 +236,83 @@ def grow_to_content(model, img, extent, spacing, margin=0.0, look=0.15, scale=0.
     return box, pts
 
 
-def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=False):
+def _surface(img, cfg, stages, T, Hc, size, I1, seg_b, page_src, sal):
+    """Detection (with the learned sheet mask when configured) and the fitted
+    GCS surface in the coarse frame ``Hc``: one surface hypothesis (dict)."""
+    H0, W0 = img.shape[:2]
+    score = None
+    Hc0, size0, I10 = Hc, size, I1
+    Hc, size, I1, S1 = detect_at_scale(img, Hc, size, I1, cfg, stages, seg_b, page_src)
+    sheet = None
+    if page_src is None and cfg.page_seg == "u2netp":
+        from .pagenet import content_points, cut_mask, sheet_mask, spread_cut
+        t = time.time()
+        sheet, info = sheet_mask(img, content_points(S1, Hc), sal=sal)
+        stages["page_seg"] = info
+        if sheet is not None:
+            k = max(3, int(round(cfg.page_erode * W0))) | 1
+            page_src = cv2.erode(sheet, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+            stages.pop("coarse_upscale", None)
+            Hc, size, I1, S1 = detect_at_scale(img, Hc0, size0, I10, cfg, stages, seg_b, page_src)
+            cut = spread_cut(S1) if cfg.page_select else None
+            if cut is not None:
+                keep = cut_mask(img.shape, cut, Hc, S1.shape)
+                sheet, page_src = sheet & keep, page_src & keep
+                info["spread_cut"] = {"x": round(float(cut[0]), 1), "deg": round(float(np.degrees(cut[1])), 1),
+                                      "keep": "left" if cut[2] else "right"}
+                stages.pop("coarse_upscale", None)
+                Hc, size, I1, S1 = detect_at_scale(img, Hc0, size0, I10, cfg, stages, seg_b, page_src)
+        T["page_seg"] = time.time() - t
+    stages["structures_coarse"] = S1.summary()
+    model = GCSModel((W0, H0), focal=cfg.focal_scale * max(W0, H0))
+    n = model.build(S1, Hc, weights=cfg.weights, ends_mode=cfg.gcs_ends)
+    stages["surface_observations"] = int(n)
+    if n >= 20:
+        fit_kw = dict(cfg.fit_kw or {})
+        outline = None
+        if cfg.b_select in ("outline", "outline_margin") and sheet is not None:
+            from .pagenet import outline_points
+            outline = outline_points(sheet)
+            if outline is not None:
+                fit_kw["finish_all"] = True
+        if cfg.edge_prefit and sheet is not None:
+            # the paper border of the learned mask (RDGR-style boundary terms):
+            # added before the first fit, so that a wrong perspective / ruling
+            # solution is not reached first and the border then judged by it
+            cand0 = page_edges(sheet, Hc, img=img)
+            if len(cand0) >= 2:
+                model.p = model.p0.copy()
+                if model.add_edges(cand0, Hc, w=cfg.edge_prefit_w, widen=cfg.edge_widen):
+                    stages["edges_prefit"] = {k: len(v) for k, v in cand0.items()}
+        model.fit(**fit_kw)
+        if outline is not None:
+            stages["b_select"] = model.select_by_outline(outline, margin=cfg.b_select == "outline_margin")
+        if sheet is not None and (cfg.quad_alt or outline is not None):
+            from .pagenet import outline_points
+            q = outline if outline is not None else outline_points(sheet)
+            sc = model.outline_score(q) if q is not None else float("nan")
+            if cfg.b_select == "outline_margin" and q is not None and np.isfinite(sc):
+                mg = model.margin_score(q)
+                sc = sc + mg if np.isfinite(mg) else sc
+            score = sc if np.isfinite(sc) else None
+    return {"Hc": Hc, "size": size, "I1": I1, "S1": S1, "sheet": sheet, "page_src": page_src, "model": model,
+            "n": n, "outline_score": score}
+
+
+def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=False, page_src=None):
+    """``page_src``: optional uint8 sheet mask on the photo (255 = sheet); the
+    detector then only takes evidence on the sheet."""
     cfg = cfg or MetricConfig()
     t0 = time.time()
     T, stages = {}, {"model": "gcs"}
     H0, W0 = img.shape[:2]
-    Hc, size, I1, quad, ang = coarse(img, cfg)
+    sal = None
+    if cfg.page_seg == "u2netp":
+        from .pagenet import saliency
+        t = time.time()
+        sal = saliency(img)
+        T["saliency"] = time.time() - t
+    Hc, size, I1, quad, ang = coarse(img, cfg, sal, stages)
     bm = BackwardMap.from_homography(Hc, size)
     cur = I1
     stages["quad"] = None if quad is None else quad.tolist()
@@ -224,26 +326,44 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
         seg_src = segment(img)
         T["segment"] = time.time() - t
     t = time.time()
-    Hc, size, I1, S1 = detect_at_scale(img, Hc, size, I1, cfg, stages, seg_src)
+    seg_b = seg_src if "b" in cfg.seg_stages else None
+    hyp = _surface(img, cfg, stages, T, Hc, size, I1, seg_b, page_src, sal)
+    if cfg.quad_alt and stages.get("quad_source") == "pagenet" and hyp["outline_score"] is not None:
+        # the learned quad gives a better coarse frame on most pages that lack a
+        # brightness quad, but on curled sheets a worse one: fit the surface in
+        # both frames and keep the more rectangular sheet outline
+        st2, T2 = {}, {}
+        Hb, sb, Ib, _, _ = coarse(img, replace(cfg, page_quad=False), None, None)
+        alt = _surface(img, cfg, st2, T2, Hb, sb, Ib, seg_b, page_src, sal)
+        choice = {"pagenet_quad": hyp["outline_score"], "no_quad": alt["outline_score"]}
+        if alt["outline_score"] is not None and alt["outline_score"] < hyp["outline_score"]:
+            hyp = alt
+            for k in [k for k in stages if k not in ("model", "quad", "skew_deg", "quad_source")]:
+                stages.pop(k)
+            stages.update(st2)
+            stages["quad"] = None
+            choice["selected"] = "no_quad"
+        else:
+            choice["selected"] = "pagenet_quad"
+        stages["quad_alt"] = choice
+    Hc, size, I1, S1, sheet, page_src, model, n = (hyp[k] for k in ("Hc", "size", "I1", "S1", "sheet", "page_src",
+                                                                   "model", "n"))
     bm = BackwardMap.from_homography(Hc, size)
     cur = I1
-    stages["structures_coarse"] = S1.summary()
     paper_src = keep_pts = None
-    model = GCSModel((W0, H0), focal=cfg.focal_scale * max(W0, H0))
-    n = model.build(S1, Hc, weights=cfg.weights, ends_mode=cfg.gcs_ends)
-    stages["surface_observations"] = int(n)
     if n >= 20:
-        model.fit(**(cfg.fit_kw or {}))
         stages["surface_candidates"] = model.fit_candidates
         stages["surface_rms_px"] = [model.rms0, model.rms]
         stages["surface_err_px"] = [model.err_median, model.err_p90]
         stages["ruling_deg"] = float(np.degrees(model.p[6]))
         mask = page_mask(img) if cfg.full_page else None
+        if cfg.page_seg_extent and sheet is not None:
+            mask = sheet
         good = ()
         # content structures (staves, rows) are surely on the sheet; free line
         # fragments and strokes may be the paper border itself
         on_sheet = model.obs[model.content]
-        if cfg.full_page and cfg.edges:
+        if cfg.full_page and cfg.edges and not (cfg.page_seg_extent and sheet is not None):
             mask = refine_page_mask(img, mask, on_sheet)
         if cfg.full_page and cfg.edges and mask is not None:
             # the mask must hold the content, else it is a lit patch / shadow
@@ -269,10 +389,12 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
         # sheet mask for the reading copy: only when it holds the content
         if mask is not None and stages.get("mask_holds_structures", 0) >= 0.97:
             paper_src = mask
-        extent = model.page_extent(mask, edges=good) if cfg.full_page else model.content_extent()
+        extent = (model.page_extent(mask, edges=good, fold_check=cfg.extent_fold) if cfg.full_page
+                  else model.content_extent())
         pts = None
         if cfg.ink_extent:
-            extent, pts = grow_to_content(model, img, extent, S1.spacing_est)
+            extent, pts = grow_to_content(model, img, extent, S1.spacing_est,
+                                          sheet=sheet if cfg.sheet_content else None)
         bm2 = model.backward_map(extent)
         W2, H2 = bm2.out_size
         finite = np.isfinite(bm2.grid).all(-1).mean()
@@ -295,8 +417,10 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
         legacy = replace(legacy, use_field=False)
     res = _finish(img, cur, bm, legacy, stages, T, t0, verbose, local_lines=cfg.local_lines,
                   merge_rows=cfg.merge_rows, keep_pts=keep_pts if cfg.ink_extent else None,
-                  margin=cfg.margin if cfg.ink_extent else 0.0, stem_refine=cfg.stem_refine, seg_src=seg_src,
-                  seg_parts=cfg.seg_parts, stem_bridge=cfg.stem_bridge)
+                  margin=cfg.margin if cfg.ink_extent else 0.0, stem_refine=cfg.stem_refine,
+                  seg_src=seg_src if "c" in cfg.seg_stages else None,
+                  seg_final=seg_src if "f" in cfg.seg_stages else None,
+                  seg_parts=cfg.seg_parts, stem_bridge=cfg.stem_bridge, page_src=page_src, seg_fuse=cfg.seg_fuse)
     if cfg.rectify_margins:
         res = rectify_margins(img, res, cfg)
     ms = margin_stats(res.structures)
@@ -372,11 +496,32 @@ def rectify_margins(img, res, cfg):
                    page_type=S.page_type, content=content)
 
 
+# Small detection models only (no learned warping); 2026-11-19 dev + real-photo
+# evaluation in reports/model_route_20261119.md.
+#   page: U²-Netp sheet mask -> evidence only on the sheet, page quad when the
+#         brightness quad fails (fitted with and without it, the more
+#         rectangular sheet outline wins), both ruling starts finished and the
+#         most rectangular outline kept, extent stops at surface folds.
+#   all:  page + homr staff lines fused per staff (stems stay classical).
+MODEL_PRESETS = {
+    "off": {},
+    "page": {"page_seg": "u2netp", "page_quad": True, "quad_alt": True, "page_erode": 0.002, "b_select": "outline",
+             "extent_fold": True},
+}
+MODEL_PRESETS["all"] = {**MODEL_PRESETS["page"], "seg": "homr", "seg_parts": "staff", "seg_fuse": "staff"}
+
+
+def preset_config(name="off", **kw) -> MetricConfig:
+    return MetricConfig(**{**MODEL_PRESETS[name], **kw})
+
+
 BENCH_METHODS = {
     # the bench measures geometry through the map; keep the working canvas so
     # runs stay comparable with earlier ones (and fast)
     "metric": lambda img: dewarp_metric(img, MetricConfig(output_res="canvas")),          # the default pipeline
     "gcs": lambda img: dewarp_metric(img, MetricConfig(residual="none", output_res="canvas")),  # surface only
+    "models_page": lambda img: dewarp_metric(img, preset_config("page", output_res="canvas")),
+    "models_all": lambda img: dewarp_metric(img, preset_config("all", output_res="canvas")),
 }
 
 

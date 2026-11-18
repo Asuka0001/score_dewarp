@@ -55,14 +55,21 @@ class Result:
 
 
 def _detect(img, *, robust=True, local_lines=False, merge_rows=False, stem_refine=False, seg=None,
-            seg_parts=None, stem_bridge=True):
-    """``seg``: learned class map (``learned.segment``) already warped onto ``img``."""
+            seg_parts=None, stem_bridge=True, page=None, seg_fuse="page"):
+    """``seg``: learned class map (``learned.segment``) already warped onto ``img``.
+    ``page``: uint8 sheet mask warped onto ``img`` (>127 = on the sheet); when
+    given, only ink on the sheet is evidence (background clutter -- wood grain,
+    brick, cloth folds -- otherwise yields free lines, strokes and text rows)."""
     norm = normalize_illumination(to_gray(img))
-    ink = binarize(norm)
+    valid = None if page is None else (page > 127).astype(np.uint8)
+    if valid is not None and valid.mean() < 0.05:
+        valid = None
+    ink = binarize(norm, valid=valid)
     from .learned import masks
     return norm, ink, detect_structures(norm, ink, robust=robust, local_lines=local_lines, merge_rows=merge_rows,
                                         stem_refine=stem_refine,
-                                        seg=masks(seg, ink.shape, parts=seg_parts, stem_bridge=stem_bridge))
+                                        seg=masks(seg, ink.shape, parts=seg_parts, stem_bridge=stem_bridge),
+                                        valid=valid, fuse=seg_fuse)
 
 
 def _warp_seg(bm, seg_src):
@@ -71,6 +78,12 @@ def _warp_seg(bm, seg_src):
     # cv2.remap takes at most 4 channels with a border value
     return np.dstack([bm.apply(np.ascontiguousarray(seg_src[..., i:i + 4]), interp=cv2.INTER_LINEAR, value=0)
                       for i in range(0, seg_src.shape[2], 4)])
+
+
+def _warp_mask(bm, mask_src):
+    if mask_src is None:
+        return None
+    return bm.apply(np.ascontiguousarray(mask_src), interp=cv2.INTER_LINEAR, value=0)
 
 
 def _filter_structures(S: Structures, priors):
@@ -211,7 +224,7 @@ def refine_dewarp(img: np.ndarray, initial_map: BackwardMap, cfg: Config | None 
 
 def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_rows=False,
             keep_pts=None, margin=0.0, stem_refine=False, seg_src=None,
-            seg_parts=None, stem_bridge=True):
+            seg_parts=None, stem_bridge=True, seg_final="same", page_src=None, seg_fuse="page"):
     """``keep_pts``: outline points of all printed content on ``cur``; the
     residual keeps them on its canvas, and the output is padded with white so
     that they keep ``margin`` (fraction of the content width) to every border."""
@@ -241,7 +254,7 @@ def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_
             _, _, S2 = _detect(cur, robust=False, local_lines=local_lines, merge_rows=merge_rows,
                                seg=_warp_seg(bm, seg_src),
                                seg_parts=seg_parts, stem_bridge=stem_bridge,
-                               stem_refine=stem_refine)
+                               stem_refine=stem_refine, page=_warp_mask(bm, page_src), seg_fuse=seg_fuse)
             S2f = _filter_structures(S2, cfg.field_priors)
             kw = {**(cfg.field_kw or {}), **((cfg.field_kw_type or {}).get(S2.page_type, {}))}
             fb = fit_field(S2f, node=cfg.field_node, priors=cfg.field_priors, keep_pts=keep_pts, **kw)
@@ -278,8 +291,11 @@ def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_
 
     # ---- D: outputs ------------------------------------------------------------
     t = time.time()
-    norm, ink, Sf = _detect(cur, merge_rows=merge_rows, stem_refine=stem_refine, seg=_warp_seg(bm, seg_src),
-                           seg_parts=seg_parts, stem_bridge=stem_bridge)
+    if isinstance(seg_final, str):   # "same": the final detection sees what the field saw
+        seg_final = seg_src
+    norm, ink, Sf = _detect(cur, merge_rows=merge_rows, stem_refine=stem_refine, seg=_warp_seg(bm, seg_final),
+                           seg_parts=seg_parts, stem_bridge=stem_bridge, page=_warp_mask(bm, page_src),
+                           seg_fuse=seg_fuse)
     enhanced = norm
     T["final_detect"] = time.time() - t
     T["total"] = time.time() - t0

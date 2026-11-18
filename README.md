@@ -8,7 +8,7 @@
 - **变换场**：输出像素 → 原图像素的 backward map（`_bmap.npy`）
 - **可打印纸页**：默认 A4 竖版、300 DPI、至少 10 mm 白边，完整等比例居中排版；导出 `_page.png`（阅读版）、`_page_color.png`（彩色版）、`_page.pdf` 和 `_preview.jpg`。
 
-不需要训练数据：页面形变由检测到的乐谱结构（谱线、简谱数字行、竖线、谱表端点）反求，全部是几何优化。可选接入一个现成的轻量五线谱分割网络（`--seg homr`），只负责检测谱线和符干，不参与求形变（见“可选：学习检测”）。
+不需要训练数据：页面形变由检测到的乐谱结构（谱线、简谱数字行、竖线、谱表端点）反求，全部是几何优化。可选接入两个现成的小检测模型（`--models page|all`：U²-Netp 纸张分割、homr 谱线分割），只负责检测，不参与求形变；在 dev 基准和真实照片上都优于无模型方案（见“可选：小检测模型”）。
 
 ## 快速开始
 
@@ -68,7 +68,32 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 混排页面上两类约束同时作用于同一个曲面和残差场。
 
-### 可选：学习检测（`--seg homr`，默认关闭）
+### 可选：小检测模型（`--models page|all`，默认关闭）
+
+```bash
+.venv/bin/python scripts/dewarp.py my_score.jpg --models page   # 纸张分割
+.venv/bin/python scripts/dewarp.py my_score.jpg --models all    # 纸张分割 + homr 谱线
+```
+
+做法与扫描类 App、RDGR 一致：小模型负责找纸和找线，几何负责求解。权重都随仓库提供（`models/`）。
+
+- **纸张分割**（`core/pagenet.py`，U²-Netp，4.6 MB，Apache-2.0，通用显著性数据训练）有三个用途：
+  - 检测只取纸面上的证据，背景的木纹、布褶不再变成伪谱线、伪竖线；
+  - 亮度法找不到纸张四边形时，补一个模型四边形，四边须有纸 / 背景的灰度台阶；
+  - B 的两个母线方向起点都优化完成后，选纸边在展平页上最接近矩形的解。
+
+  纸张掩码有门控：须为实心、页面大小、并包含已检测到的谱面。整幅纸面特写（CPMS）上显著性网络会把谱表当前景，门控会拒绝，结果与无模型相同。纸面上的印刷都算输出内容。输出范围在曲面折叠处停止（`extent_fold`，不需要模型）。
+- **homr 谱线**（`all`）：逐谱表与传统检测融合，只用网络谱线，符干仍用传统（网络符干无偏但噪声更大，会使竖线倾角变差）。
+
+| dev 120 页 | AD 中位 / 均值 / p90 / 最大 | LD 均值 | 谱线平直 均值 | 竖线倾角 均值 | CPMS 符头准确率（传统 / homr 裁判） |
+|---|---:|---:|---:|---:|---:|
+| 无模型 | 0.875 / 1.048 / 1.939 / 3.89 | 8.83 | 0.311 | 1.10° | 0.757 / 0.879 |
+| `--models page` | **0.796 / 0.950 / 1.646 / 3.64** | **8.23** | **0.250** | 0.97° | 0.756 / 0.878 |
+| `--models all` | 0.817 / 0.985 / 1.760 / 4.15 | 8.41 | 0.268 | **0.95°** | **0.763 / 0.890** |
+
+手持拍书照片 13 张目视：主页面 7 张更好、6 张持平、0 张更差。代价：每张约多 5–9 s。退化页（重度卷曲上 B 落到较差解）、对页问题和完整对照见 [模型路线报告](reports/model_route_20261119.md)。
+
+### 旧接入方式：`--seg homr`
 
 采用学习检测与几何优化分工的思路（如 RDGR 的边界 / 文本行检测 + 网格优化），接入了开源 OMR 项目 [homr](https://github.com/liebharc/homr) 的五线谱分割网络（UNet，DeepScoresV2 训练，ONNX，57 MB；输出谱线、符干 / 小节线、符头、谱号、其他符号）。PaddleOCR 的 UVDoc 文档展平模块属于另一种实现，不能直接视为这种检测 + 独立几何优化架构的例子。
 
@@ -141,15 +166,16 @@ SCOREDEWARP_SEG_CACHE=outputs/segcache .venv/bin/python scripts/eval_cpms.py --o
 
 ```
 scoredewarp/
-  core/   page.py (A)  structures.py (检测)  gcs.py (B)  field.py (C)  metric_pipeline.py (主线)
-          learned.py (可选 homr 分割)  pipeline.py (旧 ABC 与共用的收尾)  surface3d.py / line_mesh.py (旧 ABC 用)
+  core/   page.py (A)  structures.py (检测)  gcs.py (B)  field.py (C)  metric_pipeline.py (主线，MODEL_PRESETS)
+          learned.py (可选 homr 分割)  pagenet.py (可选 U²-Netp 纸张分割)  pipeline.py (旧 ABC 与共用的收尾)  surface3d.py / line_mesh.py (旧 ABC 用)
           preprocess.py (光照、二值化、纸面、阅读副本)  transforms.py (BackwardMap、原生分辨率缩放)
   eval/   geometry.py  metrics.py  structures.py  real_score.py      评测指标
   synth/  render.py  fonts.py  doc3d_retexture.py                   渲染平整乐谱页、Doc3D 重贴图
 scripts/  dewarp.py (CLI)  bench.py  bench_report.py  make_doc3d_bench.py  eval_cpms.py (CPMS 符头–谱线评测)
+          plot_model_route.py (模型路线报告图)
           make_compare_figures.py  make_route_figures.py  make_align_figures.py
           download_datasets.py  download_cpms.py  download_models.py (恢复 homr 权重)
-models/   homr/ 五线谱分割网络权重（ONNX，AGPL-3.0，见 NOTICE.md）
+models/   homr/ 五线谱分割网络权重（ONNX，AGPL-3.0，见 NOTICE.md）  u2netp/ 纸张分割权重（ONNX，Apache-2.0）
 tests/    python -m unittest discover tests
 reports/  metric_route_20261117.md（主线报告，补充一至五）与对比图
 data/     external/ 原始数据集    bench/doc3d_score/ 开发与测试基准
