@@ -8,6 +8,10 @@ Writes per input:
     <name>_debug.jpg       detected structures on the rectified image
     <name>_result.json     page type, regions, staff lines, jianpu rows, timings
     <name>_bmap.npy        backward map (output grid stride 4 -> input pixels)
+    <name>_page.png        reading copy fitted to the chosen paper (default A4)
+    <name>_page_color.png  colour version on the same paper
+    <name>_page.pdf        printable reading copy (unless --no-pdf)
+    <name>_preview.jpg     small paper-layout preview
 
 Methods
     metric       (default) page homography -> camera + developable page surface
@@ -28,6 +32,8 @@ from scoredewarp.core.pipeline import Config, dewarp, result_json  # noqa: E402
 from scoredewarp.core.preprocess import clean_page, paper_region  # noqa: E402
 from scoredewarp.core.structures import draw_structures  # noqa: E402
 from scoredewarp.core.transforms import mapping_quality  # noqa: E402
+from scoredewarp.core.document import DocumentConfig, DocumentLayout, save_document  # noqa: E402
+from scoredewarp.core.image_input import read_photo  # noqa: E402
 
 
 def main():
@@ -39,12 +45,27 @@ def main():
     ap.add_argument("--crop-content", action="store_true",
                     help="metric: output only the detected content box instead of the whole page")
     ap.add_argument("--binary", action="store_true", help="also write a black/white reading copy")
+    ap.add_argument("--paper", choices=("a4", "a3", "letter", "custom", "adaptive"), default="a4",
+                    help="output paper; adaptive preserves the rectified canvas")
+    ap.add_argument("--orientation", choices=("portrait", "landscape"), default="portrait")
+    ap.add_argument("--size-mm", nargs=2, type=float, metavar=("WIDTH", "HEIGHT"),
+                    help="custom paper dimensions; orientation determines their order")
+    ap.add_argument("--margin-mm", type=float, default=10.0, help="minimum paper margin (ignored for adaptive)")
+    ap.add_argument("--dpi", type=int, default=300, help="export resolution, default 300")
+    ap.add_argument("--no-pdf", action="store_true", help="export images only")
     args = ap.parse_args()
+    try:
+        document = DocumentConfig(args.paper, args.orientation, args.dpi, args.margin_mm, args.size_mm)
+        if document.paper != "adaptive":
+            DocumentLayout.fit((1, 1), document)  # validate rounded printable area before processing
+    except ValueError as e:
+        ap.error(str(e))
     os.makedirs(args.out, exist_ok=True)
     for path in args.inputs:
-        img = cv2.imread(path)
-        if img is None:
-            print("cannot read", path)
+        try:
+            img = read_photo(path)
+        except ValueError as e:
+            print(f"cannot read {path}: {e}", file=sys.stderr)
             continue
         name = os.path.splitext(os.path.basename(path))[0]
         if os.path.basename(path) == "photo.jpg":  # benchmark / synthetic folders
@@ -61,14 +82,26 @@ def main():
         cv2.imwrite(base + "_rectified.png", res.image)
         sp = getattr(res.structures, "spacing_est", None)
         paper = paper_region(res.paper, res.image, spacing=sp, content=getattr(res, "content", None))
-        cv2.imwrite(base + "_enhanced.png", clean_page(res.image, paper, sp))
+        reading = clean_page(res.image, paper, sp)
+        cv2.imwrite(base + "_enhanced.png", reading)
+        binary = None
         if args.binary:
-            cv2.imwrite(base + "_binary.png", clean_page(res.image, paper, sp, mode="binary"))
+            binary = clean_page(res.image, paper, sp, mode="binary")
+            cv2.imwrite(base + "_binary.png", binary)
+        layout = DocumentLayout.fit(res.bmap.out_size, document)
+        page_color = layout.render_photo(img, res.bmap)
+        page_paper = layout.render_mask(paper)
+        page_spacing = sp * layout.matrix[0, 0] if sp is not None else None
+        page_reading = clean_page(page_color, page_paper, page_spacing)
+        page_binary = clean_page(page_color, page_paper, page_spacing, mode="binary") if args.binary else None
+        save_document(base, page_reading, page_color, layout, binary=page_binary, pdf=not args.no_pdf)
+        res.stages["document"] = layout.metadata()
         cv2.imwrite(base + "_debug.jpg", draw_structures(res.image, res.structures))
         np.save(base + "_bmap.npy", res.bmap.grid.astype(np.float32))
         with open(base + "_result.json", "w") as f:
             json.dump(result_json(res), f, ensure_ascii=False, indent=1, default=float)
-        print(f"{path}: type={res.page_type} size={res.bmap.out_size} total={res.timings['total']:.1f}s")
+        print(f"{path}: type={res.page_type} rectified={res.bmap.out_size} "
+              f"paper={args.paper} size={layout.out_size} correction={res.timings['total']:.1f}s")
 
 
 if __name__ == "__main__":

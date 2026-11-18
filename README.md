@@ -6,6 +6,7 @@
 - **谱种标签**：`staff` / `jianpu` / `mixed` / `unknown`
 - **结构**：谱线折线（含线号）、简谱数字框（含 0–7 识别）、文字行框、版面区域（`_result.json`）
 - **变换场**：输出像素 → 原图像素的 backward map（`_bmap.npy`）
+- **可打印纸页**：默认 A4 竖版、300 DPI、至少 10 mm 白边，完整等比例居中排版；导出 `_page.png`（阅读版）、`_page_color.png`（彩色版）、`_page.pdf` 和 `_preview.jpg`。
 
 不需要训练数据：页面形变由检测到的乐谱结构（谱线、简谱数字行、竖线、谱表端点）反求，全部是几何优化。
 
@@ -19,7 +20,29 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python scripts/dewarp.py my_score.jpg --out outputs/run --binary
 ```
 
-iPhone 的 HEIC 照片需先转成 JPEG（OpenCV 不读 HEIC），macOS 上：`sips -s format jpeg IMG_0001.HEIC --out IMG_0001.jpg`。
+输入支持 JPEG、PNG、WebP、BMP、TIFF、HEIC 和 HEIF，也会按照片的 EXIF 方向旋正。macOS 上 HEIC/HEIF 由系统的 `sips` 解码为临时无损 PNG 并验证文件可读，原照片不变；其他系统如 Pillow 无 HEIF 解码插件，需要先自行转换成 JPEG 或 PNG。
+
+### 选择输出纸张
+
+```bash
+# 默认：A4 竖版，300 DPI，10 mm 白边，同时导出图片与单页 PDF
+.venv/bin/python scripts/dewarp.py my_score.jpg --out outputs/a4
+
+# A3 横版、15 mm 白边
+.venv/bin/python scripts/dewarp.py my_score.jpg --paper a3 --orientation landscape --margin-mm 15
+
+# 自定义纸张 190 × 260 mm；横竖方向由 --orientation 决定
+.venv/bin/python scripts/dewarp.py my_score.jpg --paper custom --size-mm 190 260
+
+# 自适应：保留矫正画布尺寸和已有白边，不强制标准纸型；仅导出图片
+.venv/bin/python scripts/dewarp.py my_score.jpg --paper adaptive --no-pdf
+```
+
+`--paper` 支持 `a4`、`a3`、`letter`、`custom`、`adaptive`，`--dpi` 设置导出分辨率。标准纸型完整容纳矫正画布，不裁切、不分别拉伸横纵比例；画布比例与纸型不同时，部分边缘留白会大于设定值。横版改变纸张方向，不旋转谱面。A4 在 300 DPI 下为 2480 × 3508 像素；PDF 物理尺寸由像素与 DPI 决定，有不足一个像素的取整误差。放大不会增加原照片细节。
+
+`_preview.jpg` 可直接查看排版效果；`_page.pdf` 默认使用阅读副本，一张照片对应一个 PDF。`--binary` 另外导出纸张尺寸的 `_page_binary.png`。纸页彩色版从原照片按最终纸张像素一次采样，阅读版再在该分辨率清理，避免把粗检测用的约 1600 像素图放大；照片本身不清晰时仍不能凭空补出细节。选择纸型只控制最终排版，不假定被拍摄的原纸也是该规格，也不修复上游的页面分离或严重褶皱问题。
+
+原有 `_rectified.png`、`_enhanced.png`、`_debug.jpg`、`_bmap.npy` 和结构坐标仍对应矫正画布。`_result.json` 的 `stages.document` 记录纸张大小、DPI、像素尺寸和 `rectified_to_document` 矩阵，供将结构坐标映射到纸页；`_bmap.npy` 不能直接当作 `_page.png` 的坐标场。
 
 其他选项：`--no-field` 只用曲面模型、不跑残差场；`--crop-content` 只输出内容框；`--method traditional` 是旧 ABC 方案，仅作对照。单张 12 MP 照片约 10 秒（Apple Silicon，单进程）。
 
