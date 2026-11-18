@@ -746,7 +746,8 @@ def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_l
         # Its classes are exclusive, so stems are cut at every staff line:
         # add the staff pixels back (a horizontal line adds only its thickness
         # to a vertical run, so it bridges stems without creating verticals).
-        stems = seg["stem"] | seg["staff"] if "staff" in seg else seg["stem"]
+        bridge = seg.get("staff", seg.get("_staff_bridge"))
+        stems = seg["stem"] | bridge if bridge is not None else seg["stem"]
         vink = np.where(band > 0, stems, ink).astype(np.uint8)
     vpts, _ = find_fragments(vink, thick, sp, horizontal=False, length=Lv)
     if stem_refine and staves:

@@ -52,6 +52,28 @@ class LearnedSegTest(unittest.TestCase):
         b = detect_structures(img, ink, robust=False, seg=seg)
         self.assertEqual(a.summary(), b.summary())
 
+    def test_stem_only_keeps_crossings_without_replacing_staff_detection(self):
+        img, staff = _page()
+        ink = (img < 128).astype(np.uint8)
+        seg = np.zeros((*img.shape, len(CHANNELS)), np.uint8)
+        seg[..., 0] = staff * 255
+        # Exclusive semantic labels: the vertical class has holes at lines.
+        stems = np.zeros_like(ink)
+        for y0 in (100, 300, 500):
+            for x in range(120, 820, 70):
+                cv2.line(stems, (x, y0 - 10), (x, y0 + 36), 1, 1)
+        seg[..., 1] = (stems & (staff == 0)) * 255
+        old = masks(seg, parts="stem", stem_bridge=False)
+        fixed = masks(seg, parts="stem")
+        self.assertNotIn("staff", fixed)
+        self.assertIn("_staff_bridge", fixed)
+        a = detect_structures(img, ink, robust=False, seg=old)
+        b = detect_structures(img, ink, robust=False, seg=fixed)
+        self.assertGreater(len(b.vsegs), len(a.vsegs))
+        self.assertEqual(len(a.staves), len(b.staves))
+        for x, y in zip(a.staves, b.staves):
+            np.testing.assert_array_equal(x.tuples, y.tuples)
+
     def test_warp_seg_many_channels(self):
         seg = np.random.default_rng(0).integers(0, 255, (50, 60, 5), dtype=np.uint8)
         bm = BackwardMap.from_homography(np.eye(3), (60, 50))

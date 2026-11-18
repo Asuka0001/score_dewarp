@@ -293,7 +293,8 @@ def _margins(lines, fwd, size, flat_w):
 
 
 def run_one(args):
-    folder, methods, save_dir = args
+    folder, methods, save_dir, *options = args
+    map_diagnostics = bool(options and options[0])
     folder = Path(folder)
     gt = json.loads((folder / "gt.json").read_text())
     meta = gt["meta"]
@@ -319,6 +320,9 @@ def run_one(args):
                 st = getattr(res, "stages", {}) or {}
                 row["notes"] = {k: st[k] for k in ("surface_rejected", "fallback", "model", "field_scale",
                                                   "surface_candidates", "field_steps") if k in st}
+                if map_diagnostics:
+                    from scoredewarp.core.transforms import mapping_quality
+                    row["notes"]["mapping_quality"] = mapping_quality(bmap, image.shape[1::-1])
                 if "field_scale" in st:   # aspect change by the residual field (invisible to ad: per-axis fit)
                     row["field_aspect"] = st["field_scale"][0] / st["field_scale"][1]
                 if save_dir:
@@ -401,6 +405,7 @@ def main():
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--filter", default="", help="substring of sample name")
     ap.add_argument("--save-images", action="store_true")
+    ap.add_argument("--map-diagnostics", action="store_true", help="record input-only local mapping checks")
     args = ap.parse_args()
     register_new_methods()
     for m in args.methods:
@@ -411,7 +416,8 @@ def main():
     if args.limit:
         folders = folders[:args.limit]
     args.out.mkdir(parents=True, exist_ok=True)
-    jobs = [(str(f), args.methods, str(args.out / "images") if args.save_images else None) for f in folders]
+    jobs = [(str(f), args.methods, str(args.out / "images") if args.save_images else None,
+             args.map_diagnostics) for f in folders]
     rows = []
     t0 = time.time()
     if args.workers > 1:

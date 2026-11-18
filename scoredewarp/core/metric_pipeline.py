@@ -78,6 +78,8 @@ class MetricConfig:
     residual: str = "field"          # none | field | mesh
     output_res: str = "native"       # native: final output sampled at the photo's own resolution | canvas
     seg: str = "off"                 # off | homr: learned staff-line / stem masks replace morphology (core/learned.py)
+    seg_parts: str | None = None     # e.g. staff / stem / staff+stem; None also honours SEG_PARTS env
+    stem_bridge: bool = True         # preserve staff crossings in the stem-only ablation
     field_iters: int = 3
     fit_kw: dict = None
     weights: dict = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
@@ -114,7 +116,8 @@ def detect_at_scale(img, Hc, size, I1, cfg, stages, seg_src=None):
     (digit strokes) would upscale jianpu pages for nothing, which hurts them.
     """
     _, _, S = _detect(I1, robust=cfg.robust_detect, local_lines=cfg.local_lines, merge_rows=cfg.merge_rows,
-                      stem_refine=cfg.stem_refine, seg=_warp_seg(BackwardMap.from_homography(Hc, size), seg_src))
+                      stem_refine=cfg.stem_refine, seg=_warp_seg(BackwardMap.from_homography(Hc, size), seg_src),
+                      seg_parts=cfg.seg_parts, stem_bridge=cfg.stem_bridge)
     if cfg.adaptive_scale != "off" and S.staves:
         sp = float(np.median([st.spacing for st in S.staves]))
         if sp < 9:
@@ -124,7 +127,8 @@ def detect_at_scale(img, Hc, size, I1, cfg, stages, seg_src=None):
             I1 = cv2.warpPerspective(img, Hc, size, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
             _, _, S = _detect(I1, robust=cfg.robust_detect, local_lines=cfg.local_lines, merge_rows=cfg.merge_rows,
                               stem_refine=cfg.stem_refine,
-                              seg=_warp_seg(BackwardMap.from_homography(Hc, size), seg_src))
+                              seg=_warp_seg(BackwardMap.from_homography(Hc, size), seg_src),
+                              seg_parts=cfg.seg_parts, stem_bridge=cfg.stem_bridge)
             stages["coarse_upscale"] = f
     return Hc, size, I1, S
 
@@ -291,7 +295,8 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
         legacy = replace(legacy, use_field=False)
     res = _finish(img, cur, bm, legacy, stages, T, t0, verbose, local_lines=cfg.local_lines,
                   merge_rows=cfg.merge_rows, keep_pts=keep_pts if cfg.ink_extent else None,
-                  margin=cfg.margin if cfg.ink_extent else 0.0, stem_refine=cfg.stem_refine, seg_src=seg_src)
+                  margin=cfg.margin if cfg.ink_extent else 0.0, stem_refine=cfg.stem_refine, seg_src=seg_src,
+                  seg_parts=cfg.seg_parts, stem_bridge=cfg.stem_bridge)
     if cfg.rectify_margins:
         res = rectify_margins(img, res, cfg)
     ms = margin_stats(res.structures)

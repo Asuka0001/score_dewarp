@@ -134,16 +134,22 @@ def segment(img: np.ndarray, *, width=None, cache_dir: str | os.PathLike | None 
     return cv2.resize(small, (W0, H0), interpolation=cv2.INTER_LINEAR)
 
 
-def masks(seg: np.ndarray | None, shape=None, parts=None) -> dict | None:
+def masks(seg: np.ndarray | None, shape=None, parts=None, *, stem_bridge=True) -> dict | None:
     """Warped seg map -> {channel: uint8 0/1 mask}.
 
     ``parts``: channels handed to the detector (default env
     ``SCOREDEWARP_SEG_PARTS``, e.g. "staff" or "stem"; all if unset) -- an
-    ablation switch: a missing channel means the classical evidence is used."""
+    ablation switch: a missing channel means the classical evidence is used.
+    When only stems are selected, ``_staff_bridge`` preserves their crossings
+    without replacing classical staff detection. ``stem_bridge=False`` restores
+    the historical, disconnected stem-only ablation."""
     if seg is None:
         return None
     parts = parts or os.environ.get("SCOREDEWARP_SEG_PARTS")
     if shape is not None and seg.shape[:2] != tuple(shape):
         seg = cv2.resize(seg, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
     keep = set(parts.split("+")) if parts else set(CHANNELS)
-    return {c: (seg[..., i] > 127).astype(np.uint8) for i, c in enumerate(CHANNELS) if c in keep}
+    out = {c: (seg[..., i] > 127).astype(np.uint8) for i, c in enumerate(CHANNELS) if c in keep}
+    if stem_bridge and "stem" in keep and "staff" not in keep:
+        out["_staff_bridge"] = (seg[..., CHANNELS.index("staff")] > 127).astype(np.uint8)
+    return out
