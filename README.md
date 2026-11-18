@@ -18,6 +18,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # 校正照片（可一次传多张）
 .venv/bin/python scripts/dewarp.py my_score.jpg --out outputs/run --binary
+
+# 推荐：加上小检测模型（纸张分割；all 再加 homr 谱线），见“可选：小检测模型”
+.venv/bin/python scripts/dewarp.py my_score.jpg --out outputs/run --models page
 ```
 
 输入支持 JPEG、PNG、WebP、BMP、TIFF、HEIC 和 HEIF，也会按照片的 EXIF 方向旋正。macOS 上 HEIC/HEIF 由系统的 `sips` 解码为临时无损 PNG 并验证文件可读，原照片不变；其他系统如 Pillow 无 HEIF 解码插件，需要先自行转换成 JPEG 或 PNG。
@@ -46,13 +49,15 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 `_rectified.png`、`_enhanced.png`、`_debug.jpg`、`_bmap.npy` 和结构坐标对应同一张输出图。`_result.json` 的 `stages.document` 记录纸张大小、DPI、像素尺寸和 `rectified_to_document` 矩阵，供将结构坐标映射到纸页；`_bmap.npy` 不能直接当作 `_page.png` 的坐标场。
 
-其他选项：`--no-field` 只用曲面模型、不跑残差场；`--crop-content` 只输出内容框；`--method traditional` 是旧 ABC 方案，仅作对照。单张 12 MP 照片约 10 秒（Apple Silicon，单进程）。
+其他选项：`--models page|all` 接入小检测模型（默认 `off`）；`--no-field` 只用曲面模型、不跑残差场；`--crop-content` 只输出内容框；`--method traditional` 是旧 ABC 方案，仅作对照。单张 12 MP 照片约 10 秒（Apple Silicon，单进程），`--models page` 约多 5 秒，`all` 约多 9 秒。
 
 ## 方法
 
 ```
-照片 ─► A 页面单应 + 纠斜 ─► 结构检测 ─► B 针孔相机 + 可展柱面拟合 ─► 重新检测 ─► C 残差场 ─► 输出范围 / 页边距 / 阅读副本
+照片 ─►（可选）纸张分割 ─► A 页面单应 + 纠斜 ─► 结构检测（纸面上）─► B 针孔相机 + 可展柱面拟合（按纸边选解）─► 重新检测 ─► C 残差场 ─► 输出范围 / 页边距 / 阅读副本
 ```
+
+括号内为 `--models page|all` 时的步骤（先找纸、再找线），见“可选：小检测模型”。
 
 - **A**（`core/page.py`）：检测页面四边形做透视矫正，再用投影轮廓纠斜；检测不到四边形时只纠斜。
 - **结构检测**（`core/structures.py`）：游程统计估计线粗和线距，逐列跟踪谱线并聚成五线谱表；简谱按字高把连通域链接成行，用模板识别 0–7；竖线（小节线、符干）只取细的部分，去掉符头 / 符尾连接处，否则符干整体偏约 1°。
@@ -93,7 +98,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 手持拍书照片 13 张目视：主页面 7 张更好、6 张持平、0 张更差。代价：每张约多 5–9 s。退化页（重度卷曲上 B 落到较差解）、对页问题和完整对照见 [模型路线报告](reports/model_route_20261119.md)。
 
-### 旧接入方式：`--seg homr`
+### 旧接入方式：`--seg homr`（已由 `--models all` 取代，保留作对照）
 
 采用学习检测与几何优化分工的思路（如 RDGR 的边界 / 文本行检测 + 网格优化），接入了开源 OMR 项目 [homr](https://github.com/liebharc/homr) 的五线谱分割网络（UNet，DeepScoresV2 训练，ONNX，57 MB；输出谱线、符干 / 小节线、符头、谱号、其他符号）。PaddleOCR 的 UVDoc 文档展平模块属于另一种实现，不能直接视为这种检测 + 独立几何优化架构的例子。
 
@@ -132,18 +137,20 @@ CPMS 上同一张校正图，手工检测器读出的符头位置准确率为 0.
 .venv/bin/python scripts/make_compare_figures.py --out reports/compare_xxx                                                  # 对比图
 ```
 
-dev 中位数（2026-11-18，当前指标定义）：
+dev 中位数（当前指标定义；主线与模型两列为 2026-11-19 同一次运行 `outputs/bench/final_models_20261119`）：
 
-| 指标 | 原图 | 旧 ABC | 主线 |
-|---|---:|---:|---:|
-| 内容区 AD（页宽 %） | 2.44 | 1.77 | **0.88** |
-| 内容区 LD（局部畸变 %） | 13.7 | 11.9 | **6.9** |
-| 可见页面保留比例 | 1.000 | 0.881 | 0.998 |
-| 谱线平直度（y 标准差 / 线距） | 1.30 | 0.71 | **0.15** |
-| 竖线倾角（°） | 2.74 | 2.50 | **0.75** |
-| 简谱基线平直度（/ 字高） | 0.51 | 0.24 | **0.084** |
-| 页边倾斜（°） | 2.26 | 1.95 | **0.54** |
-| 首末行宽度差（%） | 7.6 | 5.0 | **1.6** |
+| 指标 | 原图 | 旧 ABC | 主线（无模型） | `--models page` | `--models all` |
+|---|---:|---:|---:|---:|---:|
+| 内容区 AD（页宽 %） | 2.44 | 1.77 | 0.875 | **0.796** | 0.817 |
+| 内容区 LD（局部畸变 %） | 13.7 | 11.9 | 6.92 | 6.65 | **6.50** |
+| 可见页面保留比例 | 1.000 | 0.881 | 0.998 | 0.997 | 0.998 |
+| 谱线平直度（y 标准差 / 线距） | 1.30 | 0.71 | 0.149 | **0.141** | 0.142 |
+| 竖线倾角（°） | 2.74 | 2.50 | 0.753 | **0.687** | 0.704 |
+| 简谱基线平直度（/ 字高） | 0.51 | 0.24 | 0.084 | **0.071** | 0.077 |
+| 页边倾斜（°） | 2.26 | 1.95 | 0.541 | 0.502 | **0.450** |
+| 首末行宽度差（%） | 7.6 | 5.0 | 1.59 | **1.24** | 1.40 |
+
+均值、p90 与尾部的对比见“可选：小检测模型”和[模型路线报告](reports/model_route_20261119.md)。
 
 结构指标在整页对齐之后测量（Doc3D 的页面长宽比是任意的，对齐分别拟合 X、Y 尺度），因此一个把页面压窄的方法不能靠此降低角度指标。test 集只在 2026-11-17 评过一次，当时用的是旧指标定义，结果见报告。
 
@@ -177,11 +184,12 @@ scripts/  dewarp.py (CLI)  bench.py  bench_report.py  make_doc3d_bench.py  eval_
           download_datasets.py  download_cpms.py  download_models.py (恢复 homr 权重)
 models/   homr/ 五线谱分割网络权重（ONNX，AGPL-3.0，见 NOTICE.md）  u2netp/ 纸张分割权重（ONNX，Apache-2.0）
 tests/    python -m unittest discover tests
-reports/  metric_route_20261117.md（主线报告，补充一至五）与对比图
+reports/  metric_route_20261117.md（主线报告，补充一至五）  model_route_20261119.md（小检测模型路线）与对比图
 data/     external/ 原始数据集    bench/doc3d_score/ 开发与测试基准
           synth_dbg/ 平整页回归样例    manual_photos/ 保留的本地照片输入
 outputs/  bench/ 几何评测与消融记录    cpms_eval_20261118/ 60 张真实照片评测
-          cpms_detection_20261118_local/ 本轮 12 张照片对照
+          cpms_detection_20261118_local/ 12 张照片检测对照    cpms_models_20261119/ 模型路线 CPMS 60 张
+          manual_check_20261119/ 手持照片无模型 / 模型对照面板
           examples/{a4,native,manual_photos}/ 代表性校正和纸页导出
           segcache/ 分割缓存
 ```
@@ -192,11 +200,12 @@ outputs/  bench/ 几何评测与消融记录    cpms_eval_20261118/ 60 张真实
 
 2026-11-18 稳定性实验：主线默认检查残差网格的局部有效性，遇到翻转或极端伸缩时缩步，仍无效则保留上一轮。120 页 dev 未触发检查、AD 逐页不变，因此尚无实测精度提升。双起点完整优化改善尾部误差但仍有退化页，竖线按跨线数量赋权整体变差，均未设为默认。详见 [稳定性消融报告](reports/stability_20261118.md)。
 
-1. **两页摊开、背景杂乱的照片**（2026-11-18 的手持拍书测试）：主页面能展平，但输出里会留下对面那页、桌面和手，阅读副本把背景变成灰色纹理。需要只保留主页面。
+1. **两页摊开、背景杂乱的照片**：`--models` 的纸张分割已去掉桌面、手等背景对检测的干扰，主页面明显更平；但输出范围仍常包含对面那页（被拉花），需要只保留主页面。
 2. **对面那页不会被展平**：曲面模型一次只表示一张纸。
-3. **严重褶皱页上曲面拟合会陷入局部解**（如 dev 0004）：输入稍有变化结果就可能差很多，需要多起点拟合。
+3. **严重褶皱页上曲面拟合会陷入局部解**：证据稍有变化，约四分之一的页面 AD 变化超过 0.3。`--models` 的纸边选解只在两个母线方向起点之间选；多数页面两者收敛到同一个解，所以仍有退化页（如 dev 0045、0111）。
 4. **方向**：90° 检测默认关闭，180° 未处理。
-5. **输出范围外推**：个别重度形变页上，曲面稍有变化就会把画布外推到页外并带出重复内容（如 dev 0098 在 `--seg homr` 下 AD 升到 9.6）；与是否使用分割无关，是开关分割对比中尾部波动的主要来源。
+5. **简谱页**仍是最差类型（`--models page` 下 AD 均值 1.27，五线谱 0.89），没有学习检测。
+6. **输出范围外推**：曲面越过折叠时会带出镜像的重复内容（如 dev 0098 在 `--seg homr` 下 AD 9.6）。`--models` 预设中的 `extent_fold` 与纸边选解已消除这类情况，默认（无模型）未开启。
 
 ## 历史
 
