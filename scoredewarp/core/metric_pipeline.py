@@ -47,7 +47,7 @@ DEFAULT_WEIGHTS = {"vseg": 5.0}
 # tuples stop short of the ends and split staves broke the chain, so the
 # margins kept a slant / keystone (the "top wide, bottom narrow" CPMS pages).
 DEFAULT_FIELD = {"tuple_u": 0.0, "vseg_w": 4.0, "lam_u": 3.0, "lam_v": 0.5, "spacing_gate": 9.0, "ends_w": 2.0,
-                 "ends_mode": "rows", "keep_scale": True, "anchor": True}
+                 "ends_mode": "rows", "keep_scale": True, "anchor": True, "guard": True}
 DEFAULT_FIELD_TYPE = {"jianpu": {"vseg_w": 8.0}, "mixed": {"lam_u": 1.5}}   # on top of DEFAULT_FIELD
 
 
@@ -220,6 +220,7 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
     stages["surface_observations"] = int(n)
     if n >= 20:
         model.fit(**(cfg.fit_kw or {}))
+        stages["surface_candidates"] = model.fit_candidates
         stages["surface_rms_px"] = [model.rms0, model.rms]
         stages["surface_err_px"] = [model.err_median, model.err_p90]
         stages["ruling_deg"] = float(np.degrees(model.p[6]))

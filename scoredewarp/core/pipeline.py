@@ -232,6 +232,10 @@ def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_
             fb = fit_field(S2f, node=cfg.field_node, priors=cfg.field_priors, keep_pts=keep_pts, **kw)
             if fb is None:
                 break
+            step = getattr(fb, "field_step", 1.0)
+            stages.setdefault("field_steps", []).append(step)
+            if step == 0:
+                break
             if keep_pts is not None:
                 keep_pts = fb.forward(keep_pts)
             sc = stages.setdefault("field_scale", [1.0, 1.0])   # product over iterations

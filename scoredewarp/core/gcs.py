@@ -265,14 +265,21 @@ class GCSModel:
         return A
 
     def fit(self, lam_curv=40.0, lam_th=0.3, lam_sp=2.0, lam_h=1.0, max_nfev=200, phis=(0.0, np.pi / 2),
-            warm=False):
-        """``warm``: continue from ``self.p0`` as is (no ruling-direction restarts)."""
+            warm=False, finish_all=False):
+        """Fit with short direction restarts, optionally finishing every start.
+
+        ``finish_all`` compares fully refined candidates using the same robust
+        objective; it does not guarantee lower ground-truth distortion.
+        ``warm`` continues from ``self.p0`` without direction restarts.
+        """
         self.lam_curv, self.lam_th, self.lam_sp, self.lam_h = lam_curv, lam_th, lam_sp, lam_h
-        self.fit_kw = dict(lam_curv=lam_curv, lam_th=lam_th, lam_sp=lam_sp, lam_h=lam_h, max_nfev=max_nfev)
+        self.fit_kw = dict(lam_curv=lam_curv, lam_th=lam_th, lam_sp=lam_sp, lam_h=lam_h,
+                           max_nfev=max_nfev, finish_all=finish_all)
         n = 2 * len(self.obs)
         r0 = self.residuals(self.p0)
         self.rms0 = float(np.sqrt(np.mean(r0[:n] ** 2)))
         best = None
+        self.fit_candidates = []
         sp = self.sparsity()
         kw = dict(jac_sparsity=sp, method="trf", loss="soft_l1", f_scale=3.0, x_scale="jac")
         if warm:
@@ -282,9 +289,18 @@ class GCSModel:
                 p0 = self.p0.copy()
                 p0[6] = phi
                 res = least_squares(self.residuals, p0, max_nfev=max(20, max_nfev // 5), **kw)
+                short_cost = float(res.cost)
+                if finish_all:
+                    res = least_squares(self.residuals, res.x, max_nfev=max_nfev, **kw)
+                self.fit_candidates.append({"phi_deg": float(np.degrees(phi)),
+                                            "short_cost": short_cost, "cost": float(res.cost),
+                                            "finished": bool(finish_all)})
                 if best is None or res.cost < best.cost:
                     best = res
-            best = least_squares(self.residuals, best.x, max_nfev=max_nfev, **kw)
+                    best_index = len(self.fit_candidates) - 1
+            if not finish_all:
+                best = least_squares(self.residuals, best.x, max_nfev=max_nfev, **kw)
+            self.fit_candidates[best_index].update(cost=float(best.cost), finished=True, selected=True)
         self.p = best.x
         self.rms = float(np.sqrt(np.mean(best.fun[:n] ** 2)))
         e = np.hypot(*best.fun[:n].reshape(-1, 2).T) / np.maximum(self.w, 1e-9)

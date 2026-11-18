@@ -1,5 +1,7 @@
 import sys
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +27,27 @@ def _model(phi, theta):
 
 
 class GCSTests(unittest.TestCase):
+    def test_finish_all_retains_candidate_that_wins_after_refinement(self):
+        # Direction 0 wins the short run (10 < 20), but direction 90 wins
+        # after refinement (1 < 8). No image/ground truth enters selection.
+        def solve(fun, x, **kw):
+            p = x.copy()
+            short = p[0] == 0
+            p[0] += 1
+            cost = (10 if p[6] == 0 else 20) if short else (8 if p[6] == 0 else 1)
+            return SimpleNamespace(x=p, cost=cost, fun=np.zeros(2))
+
+        for finish_all, expected in ((False, 0.0), (True, np.pi / 2)):
+            m = GCSModel((1200, 1600))
+            m.p0 = np.zeros(7)
+            m.obs, m.w = np.zeros((1, 2)), np.ones(1)
+            m.residuals = lambda p: np.zeros(2)
+            m.sparsity = lambda: None
+            with patch("scoredewarp.core.gcs.least_squares", side_effect=solve):
+                m.fit(finish_all=finish_all)
+            self.assertEqual(m.p[6], expected)
+            self.assertEqual(len(m.fit_candidates), 2)
+
     def test_surface_is_isometric_for_any_ruling_direction(self):
         rng = np.random.default_rng(0)
         for phi in (0.0, 0.4, np.pi / 2, 2.0):

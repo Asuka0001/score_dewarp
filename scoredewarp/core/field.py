@@ -176,8 +176,31 @@ def margin_stats(S: Structures, min_rows=3):
     return out
 
 
+def _vertical_support(pts, staves):
+    """Conservative staff-crossing evidence, independent of stroke angle.
+
+    A full-height stroke gets weight 1, a fragment gets at least 0.5.
+    This is a geometric heuristic, not a calibrated barline classifier.
+    """
+    if not staves:
+        return 1.0
+    x = float(np.median(pts[:, 0]))
+    ymin, ymax = np.min(pts[:, 1]), np.max(pts[:, 1])
+    crossings = 0
+    for st in staves:
+        t = np.asarray(st.tuples)
+        if not len(t):
+            continue
+        xs = t[:, 2, 0]
+        if not xs.min() - st.spacing <= x <= xs.max() + st.spacing:
+            continue
+        ys = t[np.argmin(np.abs(xs - x)), :, 1]
+        crossings = max(crossings, int(((ys >= ymin) & (ys <= ymax)).sum()))
+    return 0.5 + 0.1 * crossings
+
+
 def build_constraints(S: Structures, grid, priors=("staff", "jianpu", "text", "vertical"), tuple_u=0.3, vseg_w=0.6,
-                      spacing_gate=0.2, ends_w=0.0, ends_mode="chain"):
+                      spacing_gate=0.2, ends_w=0.0, ends_mode="chain", vseg_balance=False):
     """``tuple_u`` ties U of the 5 staff lines at one *current* image column, which
     preserves whatever shear the current image has; 0 lets vertical strokes decide.
     ``spacing_gate``: a staff (jianpu row) whose spacing (digit height) deviates
@@ -263,7 +286,12 @@ def build_constraints(S: Structures, grid, priors=("staff", "jianpu", "text", "v
         for v in S.vsegs:
             p = _sub(v.pts, 15)
             if len(p) >= 2:
-                U.diff(p[1:], p[:-1], 0.0, vseg_w)
+                w = vseg_w
+                if vseg_balance and S.staves:
+                    # Bound the squared weight per stroke to four intervals;
+                    # leave jianpu-only pages unchanged in this experiment.
+                    w *= _vertical_support(v.pts, S.staves) * np.sqrt(min(1., 4. / (len(p) - 1)))
+                U.diff(p[1:], p[:-1], 0.0, w)
     return U, V
 
 
@@ -277,9 +305,39 @@ def _content_points(S: Structures):
     return np.concatenate(P) if P else None
 
 
+def _guard_field(UV, identity, node, min_scale=0.2, max_scale=5.0):
+    """Backtrack until every bilinear cell has a well-conditioned Jacobian.
+
+    Check all four corners, not only the centre: the determinant of a
+    bilinear cell is affine, so positive corner values exclude local folds
+    throughout that cell. This is a local check, not global injectivity.
+    """
+    identity = np.asarray(identity, dtype=float)
+    if not np.isfinite(UV).all():
+        return identity.copy(), 0.0
+    for alpha in (1.0, 0.5, 0.25, 0.125, 0.0625):
+        trial = identity + alpha * (UV - identity)
+        dx = np.diff(trial, axis=1) / node
+        dy = np.diff(trial, axis=0) / node
+        good = True
+        for x in (dx[:-1], dx[1:]):
+            for y in (dy[:, :-1], dy[:, 1:]):
+                J = np.stack([x, y], axis=-1)
+                sv = np.linalg.svd(J, compute_uv=False)
+                if (np.any(np.linalg.det(J) <= 0) or np.any(sv[..., -1] < min_scale)
+                        or np.any(sv[..., 0] > max_scale)):
+                    good = False
+                    break
+            if not good:
+                break
+        if good:
+            return trial, alpha
+    return identity.copy(), 0.0
+
+
 def fit_field(S: Structures, node=48, lam=6.0, mu=0.02, priors=("staff", "jianpu", "text", "vertical"),
               tuple_u=0.3, vseg_w=0.6, lam_u=None, lam_v=None, spacing_gate=0.2, ends_w=0.0, keep_scale=False,
-              anchor=False, keep_pts=None, ends_mode="chain"):
+              anchor=False, keep_pts=None, ends_mode="chain", guard=False, vseg_balance=False):
     """``lam_u`` / ``lam_v`` override the smoothness per component: V is pinned by
     many reliable staff lines, U only by short, noisier vertical strokes.
     ``keep_scale``: constrain U and V to unit mean gradient in the solve (global
@@ -289,11 +347,13 @@ def fit_field(S: Structures, node=48, lam=6.0, mu=0.02, priors=("staff", "jianpu
     ``keep_pts``: further content points for the anchor (outlines of all
     printed content: notes below the staves, dynamics, exercise numbers),
     which the detected structures alone miss.
+    ``guard``: backtrack displacement to keep each cell locally invertible
+    with corner singular values between 0.2 and 5; fall back to identity.
     The returned map carries ``forward(pts)``: input -> output coordinates."""
     H, W = S.shape
     g = _Grid(W, H, node)
     U, V = build_constraints(S, g, priors, tuple_u=tuple_u, vseg_w=vseg_w, spacing_gate=spacing_gate, ends_w=ends_w,
-                             ends_mode=ends_mode)
+                             ends_mode=ends_mode, vseg_balance=vseg_balance)
     if not U.A or not V.A:
         return None
     if keep_scale:
@@ -307,9 +367,12 @@ def fit_field(S: Structures, node=48, lam=6.0, mu=0.02, priors=("staff", "jianpu
     sm = g.smooth_ops()
     u = U.solve(sm, lam if lam_u is None else lam_u, gx.ravel().astype(float), mu)
     v = V.solve(sm, lam if lam_v is None else lam_v, gy.ravel().astype(float), mu)
-    # mean gradient = the field's global scale change per axis (1 with keep_scale)
-    scale = tuple(float(np.diff(c.reshape(g.ny, g.nx), axis=ax).mean() / node) for c, ax in ((u, 1), (v, 0)))
     UV = np.stack([u, v], 1).reshape(g.ny, g.nx, 2)
+    alpha = 1.0
+    if guard:
+        UV, alpha = _guard_field(UV, np.stack([gx, gy], -1), node)
+    # Report the accepted map's scale, including any backtracking.
+    scale = tuple(float(np.diff(UV[..., k], axis=ax).mean() / node) for k, ax in ((0, 1), (1, 0)))
     pts = _content_points(S) if anchor else None
     if pts is not None and keep_pts is not None and len(keep_pts):
         pts = np.concatenate([pts, np.asarray(keep_pts, float).reshape(-1, 2)])
@@ -344,4 +407,5 @@ def fit_field(S: Structures, node=48, lam=6.0, mu=0.02, priors=("staff", "jianpu
     bm.forward_nodes = UV
     bm.forward = lambda p: g.weights(p) @ UV.reshape(-1, 2)
     bm.field_scale = scale
+    bm.field_step = alpha
     return bm

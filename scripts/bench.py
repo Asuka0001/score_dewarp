@@ -317,7 +317,8 @@ def run_one(args):
             if res is not None:
                 row["out_size"] = list(bmap.out_size)
                 st = getattr(res, "stages", {}) or {}
-                row["notes"] = {k: st[k] for k in ("surface_rejected", "fallback", "model", "field_scale") if k in st}
+                row["notes"] = {k: st[k] for k in ("surface_rejected", "fallback", "model", "field_scale",
+                                                  "surface_candidates", "field_steps") if k in st}
                 if "field_scale" in st:   # aspect change by the residual field (invisible to ad: per-axis fit)
                     row["field_aspect"] = st["field_scale"][0] / st["field_scale"][1]
                 if save_dir:
