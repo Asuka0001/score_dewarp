@@ -61,5 +61,21 @@ class LearnedSegTest(unittest.TestCase):
         self.assertIsNone(_warp_seg(bm, None))
 
 
+class BundledModelTest(unittest.TestCase):
+    def test_bundled_model_finds_staff_lines(self):
+        import os
+        from scoredewarp.core import learned
+        if not learned.available():
+            self.skipTest("onnxruntime or bundled model missing")
+        os.environ["SCOREDEWARP_SEG_COREML"] = "0"     # plain CPU in tests
+        img, staff = _page(n_staves=2, W=640, H=480, sp=16)
+        seg = learned.segment(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR), width=640)
+        self.assertEqual(seg.shape, (480, 640, len(CHANNELS)))
+        pred = seg[..., CHANNELS.index("staff")] > 127
+        near = cv2.dilate(staff, np.ones((5, 5), np.uint8)) > 0
+        self.assertGreater(pred[near].mean(), 0.3)       # lines are found ...
+        self.assertLess(pred[~near].mean(), 0.02)        # ... and little else
+
+
 if __name__ == "__main__":
     unittest.main()

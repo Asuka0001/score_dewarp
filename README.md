@@ -73,10 +73,10 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 参考扫描软件 / 文档矫正的常见做法（轻量模型只做检测，几何求解器负责展平，如 RDGR、PaddleOCR 文档预处理），接入了开源 OMR 项目 [homr](https://github.com/liebharc/homr) 的五线谱分割网络（UNet，DeepScoresV2 训练，ONNX，57 MB；输出谱线、符干 / 小节线、符头、谱号、其他符号）。
 
 ```bash
-.venv/bin/pip install onnxruntime
-.venv/bin/python scripts/download_models.py          # 权重下载到 data/external/models/homr/，不随仓库分发
 .venv/bin/python scripts/dewarp.py my_score.jpg --seg homr
 ```
+
+权重随仓库提供（`models/homr/`，57 MB，来源与许可见其 `NOTICE.md`），依赖 `onnxruntime`（已在 `requirements.txt` 中）。缺失时可用 `scripts/download_models.py` 从 homr 的发布页重新下载。
 
 - **推理**（`core/learned.py`）：自写滑窗推理，复现 homr 的预处理（灰度 + CLAHE、320 px 窗口、半窗步长）；输入宽度按实测线距缩放到约 16 px / 线距（homr 固定宽 1920，在低分辨率照片上会整排漏检谱表）。macOS 上用 CoreML，约 2–5 s / 页；`SCOREDEWARP_SEG_CACHE` 可缓存结果。分割图在照片上算一次，随图像用同一个 `BackwardMap` 重采样，每轮重新检测都复用。
 - **融合**（`structures.py`）：谱表取网络谱线掩码与形态学检测中覆盖谱线总长更长的一方；谱表区内的竖笔画取网络的符干 / 小节线（不含符头，从源头去掉符干约 1° 的偏斜），并把谱线像素补回（网络类别互斥，符干在每条谱线处被切断）；网络找不到谱表时（简谱页）完全走原流程，结果逐像素不变。
@@ -91,7 +91,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 | CPMS 端到端：同一裁判读校正结果的符头位置准确率 | 0.879 | 0.873 |
 | CPMS 端到端：校正后谱线残余弯曲（线距）/ 倾斜 | 0.020 / 0.04° | **0.016 / 0.02°** |
 
-CPMS 上同一张校正图，手工检测器读出的符头位置准确率为 0.76，网络读出 0.88：网络的价值主要在输出结构（谱线、音高位置，便于 OMR），而非形变求解。homr 的代码和权重均为 AGPL-3.0（训练数据 DeepScoresV2 为 CC BY 4.0），本仓库只在运行时下载权重。
+CPMS 上同一张校正图，手工检测器读出的符头位置准确率为 0.76，网络读出 0.88：网络的价值主要在输出结构（谱线、音高位置，便于 OMR），而非形变求解。homr 的代码和权重均为 AGPL-3.0（训练数据 DeepScoresV2 为 CC BY 4.0）；本仓库是个人非商用 demo，原样附带该权重。
 
 ## 评测
 
@@ -146,7 +146,8 @@ scoredewarp/
   synth/  render.py  fonts.py  doc3d_retexture.py                   渲染平整乐谱页、Doc3D 重贴图
 scripts/  dewarp.py (CLI)  bench.py  bench_report.py  make_doc3d_bench.py  eval_cpms.py (CPMS 符头–谱线评测)
           make_compare_figures.py  make_route_figures.py  make_align_figures.py
-          download_datasets.py  download_cpms.py  download_models.py (homr 权重)
+          download_datasets.py  download_cpms.py  download_models.py (恢复 homr 权重)
+models/   homr/ 五线谱分割网络权重（ONNX，AGPL-3.0，见 NOTICE.md）
 tests/    python -m unittest discover tests
 reports/  metric_route_20261117.md（主线报告，补充一至五）与对比图
 ```

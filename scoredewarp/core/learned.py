@@ -7,8 +7,9 @@ by their noteheads / flags).
 
 Model: homr ``segnet`` (UNet adapted from oemer, trained on DeepScoresV2),
 https://github.com/liebharc/homr  -- code and weights AGPL-3.0, training data
-CC BY 4.0. The weights are NOT shipped with this repository; download them with
-``scripts/download_models.py`` (or point ``SCOREDEWARP_SEGNET`` at the .onnx).
+CC BY 4.0. The weights are included in this repository under
+``models/homr/`` (see its NOTICE.md); ``scripts/download_models.py`` restores
+them from the homr release, ``SCOREDEWARP_SEGNET`` points to another .onnx.
 Inference here is our own sliding-window code that mirrors homr's
 preprocessing: width set from the staff spacing (``model_width``), CLAHE grey, 320 px windows, half-window stride.
 
@@ -31,7 +32,7 @@ _HOMR_CLASSES = {4: 0, 1: 1, 2: 2, 3: 3, 5: 4}
 SEGNET_NAME = "segnet_308-3296ccd40960f90ca6ab9c035cca945675d30a0f"
 SEGNET_URL = f"https://github.com/liebharc/homr/releases/download/onnx_checkpoints/{SEGNET_NAME}.zip"
 _REPO = Path(__file__).resolve().parents[2]
-DEFAULT_PATH = _REPO / "data" / "external" / "models" / "homr" / f"{SEGNET_NAME}.onnx"
+DEFAULT_PATH = _REPO / "models" / "homr" / f"{SEGNET_NAME}.onnx"
 
 _SESSION = None
 
@@ -54,7 +55,7 @@ def _session():
         import onnxruntime as ort
         p = model_path()
         if not p.exists():
-            raise FileNotFoundError(f"segmentation model not found: {p} (run scripts/download_models.py)")
+            raise FileNotFoundError(f"segmentation model not found: {p} (restore it with scripts/download_models.py)")
         prov = ["CPUExecutionProvider"]
         if os.environ.get("SCOREDEWARP_SEG_COREML", "1") == "1" and "CoreMLExecutionProvider" in ort.get_available_providers():
             prov = ["CoreMLExecutionProvider", "CPUExecutionProvider"]

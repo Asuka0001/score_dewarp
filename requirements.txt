@@ -2,5 +2,4 @@ numpy>=1.26
 scipy>=1.11
 opencv-python-headless>=4.9
 pillow>=10.0
-# optional: learned staff segmentation (--seg homr, scripts/download_models.py)
-# onnxruntime>=1.18
+onnxruntime>=1.18   # learned staff segmentation (--seg homr, models/homr/)

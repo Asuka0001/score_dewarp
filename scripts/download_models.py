@@ -1,11 +1,12 @@
-"""Download the optional learned staff segmentation model (homr segnet, ONNX).
+"""Restore the learned staff segmentation model (homr segnet, ONNX) if missing.
 
     python scripts/download_models.py
 
-The weights are AGPL-3.0 (homr, https://github.com/liebharc/homr; trained on
-DeepScoresV2, CC BY 4.0). They are downloaded to data/external/models/homr/
-and are not part of this repository. Used by ``--seg homr`` /
-``MetricConfig(seg="homr")``; requires ``pip install onnxruntime``.
+The weights ship with this repository in models/homr/ (AGPL-3.0, from homr,
+https://github.com/liebharc/homr; trained on DeepScoresV2, CC BY 4.0, see
+models/homr/NOTICE.md). This script only re-downloads them from the homr
+release, e.g. after a shallow / LFS-less checkout. Used by ``--seg homr`` /
+``MetricConfig(seg="homr")``.
 """
 import hashlib
 import os
