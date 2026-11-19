@@ -255,6 +255,19 @@ def refine_dewarp(img: np.ndarray, initial_map: BackwardMap, cfg: Config | None 
     return _finish(img, cur, bm, cfg, stages, T, t0, verbose)
 
 
+def _block_box(S: Structures):
+    """(x0, x1, y0, y1) of the printed block: staff lines and jianpu rows
+    (2 / 98 % quantiles), or None."""
+    P = [S.fragments[fi].pts for st in S.staves for fi in st.frag_ids]
+    P += [np.array([[b.x0, b.y0], [b.x1, b.y1]], float) for r in S.rows if r.kind == "jianpu" for b in r.blobs]
+    P = [np.asarray(p, float).reshape(-1, 2) for p in P if len(p)]
+    if not P:
+        return None
+    P = np.concatenate(P)
+    (x0, y0), (x1, y1) = np.percentile(P, 2, axis=0), np.percentile(P, 98, axis=0)
+    return float(x0), float(x1), float(y0), float(y1)
+
+
 def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_rows=False,
             keep_pts=None, margin=0.0, stem_refine=False, seg_src=None,
             seg_parts=None, stem_bridge=True, seg_final="same", page_src=None, seg_fuse="page", page_rim=False,
@@ -284,6 +297,10 @@ def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_
     # ---- C: residual field ---------------------------------------------------
     if cfg.use_field and (mesh_info is None or mesh_info['staff_systems'] == 0):
         t = time.time()
+        contour = None
+        if page_src is not None and (cfg.field_kw or {}).get("sheet_w", 0) > 0:
+            from .page import sheet_contour
+            contour = sheet_contour(page_src, img)
         for _ in range(cfg.field_iters):
             _, _, S2 = _detect(cur, robust=False, local_lines=local_lines, merge_rows=merge_rows,
                                seg=_warp_seg(bm, seg_src),
@@ -292,6 +309,11 @@ def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_
                                rim=page_rim, jp_rows=jp_rows, glyph=glyph)
             S2f = _filter_structures(S2, cfg.field_priors)
             kw = {**(cfg.field_kw or {}), **((cfg.field_kw_type or {}).get(S2.page_type, {}))}
+            if contour is not None:
+                from .page import sheet_sides
+                sides = sheet_sides(contour, bm.forward_points, bm.out_size, block=_block_box(S2))
+                kw["sheet_sides"] = sides
+                stages.setdefault("sheet_sides", []).append({k: len(v) for k, v in sides.items()})
             fb = fit_field(S2f, node=cfg.field_node, priors=cfg.field_priors, keep_pts=keep_pts, **kw)
             if fb is None:
                 break

@@ -582,10 +582,16 @@ def rectify_margins(img, res, cfg):
 #         rectangular sheet outline wins), both ruling starts finished and the
 #         most rectangular outline kept, extent stops at surface folds.
 #   all:  page + homr staff lines fused per staff (stems stay classical).
+#         The residual field also keeps the sheet's own paper edges straight
+#         (field sheet_w, page.sheet_sides): the margins outside the outermost
+#         staves have no other evidence and kept the surface's error (IMG_3683
+#         fan curl: left paper edge slanted / bent). Dev 2026-11-19 vs page
+#         without it: edge_deg 53 better / 13 worse, lalign 53 / 4, kst 50 / 20,
+#         ad_c 31 / 26, ld_c 31 / 33.
 MODEL_PRESETS = {
     "off": {},
     "page": {"page_seg": "u2netp", "page_quad": True, "quad_alt": True, "page_erode": 0.002, "b_select": "outline",
-             "extent_fold": True},
+             "extent_fold": True, "field_kw": {**DEFAULT_FIELD, "sheet_w": 4.0}},
 }
 MODEL_PRESETS["all"] = {**MODEL_PRESETS["page"], "seg": "homr", "seg_parts": "staff", "seg_fuse": "staff"}
 

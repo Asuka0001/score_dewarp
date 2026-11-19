@@ -253,7 +253,8 @@ def _digit_widths(rows):
 
 def build_constraints(S: Structures, grid, priors=("staff", "jianpu", "text", "vertical"), tuple_u=0.3, vseg_w=0.6,
                       spacing_gate=0.2, ends_w=0.0, ends_mode="chain", vseg_balance=False, h_ruler="vertical",
-                      row_u=0.3, text_u=None, block_jp=False, edge_w=0.0, size_classes=False):
+                      row_u=0.3, text_u=None, block_jp=False, edge_w=0.0, size_classes=False, sheet_sides=None,
+                      sheet_w=0.0):
     """``h_ruler``: what sets lengths along staff lines / jianpu rows (U).
     vertical: the local staff spacing / digit height (assumes the page is
     foreshortened equally in x and y, blind to x-only compression);
@@ -279,6 +280,14 @@ def build_constraints(S: Structures, grid, priors=("staff", "jianpu", "text", "v
     into pieces, or an indented / short staff, breaks two links); "rows" one
     end per staff row with outliers removed (``_row_ends``)."""
     U, V = _System(grid), _System(grid)
+    if sheet_sides and sheet_w > 0:
+        # the paper's own edges are straight lines on the flat sheet: points
+        # along its left / right side share one U, along top / bottom one V
+        # (``page.sheet_sides``). The only evidence in the margins outside the
+        # outermost staves, where the field otherwise extrapolates the surface
+        for side, p in sheet_sides.items():
+            if len(p) >= 3:
+                (U if side in ("left", "right") else V).diff(p[1:], p[:-1], 0.0, sheet_w)
     staves = S.staves if "staff" in priors else []
     s_all = np.array([st.spacing for st in staves])
     # references per printed staff size (spacing_classes): a violin staff above
@@ -436,7 +445,8 @@ def _guard_field(UV, identity, node, min_scale=0.2, max_scale=5.0):
 def fit_field(S: Structures, node=48, lam=6.0, mu=0.02, priors=("staff", "jianpu", "text", "vertical"),
               tuple_u=0.3, vseg_w=0.6, lam_u=None, lam_v=None, spacing_gate=0.2, ends_w=0.0, keep_scale=False,
               anchor=False, keep_pts=None, ends_mode="chain", guard=False, vseg_balance=False, h_ruler="vertical",
-              row_u=0.3, text_u=None, block_jp=False, edge_w=0.0, size_classes=False):
+              row_u=0.3, text_u=None, block_jp=False, edge_w=0.0, size_classes=False, sheet_sides=None,
+              sheet_w=0.0):
     """``lam_u`` / ``lam_v`` override the smoothness per component: V is pinned by
     many reliable staff lines, U only by short, noisier vertical strokes.
     ``keep_scale``: constrain U and V to unit mean gradient in the solve (global
@@ -453,7 +463,8 @@ def fit_field(S: Structures, node=48, lam=6.0, mu=0.02, priors=("staff", "jianpu
     g = _Grid(W, H, node)
     U, V = build_constraints(S, g, priors, tuple_u=tuple_u, vseg_w=vseg_w, spacing_gate=spacing_gate, ends_w=ends_w,
                              ends_mode=ends_mode, vseg_balance=vseg_balance, h_ruler=h_ruler, row_u=row_u, text_u=text_u,
-                             block_jp=block_jp, edge_w=edge_w, size_classes=size_classes)
+                             block_jp=block_jp, edge_w=edge_w, size_classes=size_classes, sheet_sides=sheet_sides,
+                             sheet_w=sheet_w)
     if not U.A or not V.A:
         return None
     if keep_scale:

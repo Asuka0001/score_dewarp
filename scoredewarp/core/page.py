@@ -263,6 +263,111 @@ def page_edges(mask: np.ndarray, H_coarse: np.ndarray, *, img=None, min_grad=8.0
     return out
 
 
+def sheet_contour(mask: np.ndarray, img: np.ndarray, *, min_grad=8.0, contrast=20.0, off=(0.012, 0.025, 0.04),
+                  border=0.006):
+    """Outer contour of a sheet mask on the photo, smoothed, and per point
+    whether it is a real paper edge: a sharp colour step (``edge_strength``),
+    a brightness change of at least ``contrast`` grey levels between the paper
+    just inside and the surface outside at every distance in ``off`` (fractions
+    of the photo width across the contour: background, not a book's gutter
+    with the facing page right behind its shadow, nor a mask boundary through
+    paper) and not on the photo frame.
+    Returns ((N, 2) photo points, (N,) bool) or None."""
+    if mask is None:
+        return None
+    H0, W0 = mask.shape[:2]
+    cnts, _ = cv2.findContours((mask > 0).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cnts:
+        return None
+    c0 = max(cnts, key=cv2.contourArea).reshape(-1, 2).astype(np.float64)
+    if len(c0) < 100:
+        return None
+    k = max(3, int(round(max(H0, W0) / 800 * 3)) | 1)
+    pad = np.concatenate([c0[-k:], c0, c0[:k]])
+    ker = np.ones(2 * k + 1) / (2 * k + 1)
+    c0 = np.stack([np.convolve(pad[:, d], ker, "same")[k:-k] for d in (0, 1)], 1)
+    tol = border * max(H0, W0)
+    ok = ~((c0[:, 0] < tol) | (c0[:, 0] > W0 - 1 - tol) | (c0[:, 1] < tol) | (c0[:, 1] > H0 - 1 - tol))
+    ok &= edge_strength(img, c0) >= min_grad
+    # normal from the tangent over ~2k points; outward = off the mask
+    t = np.roll(c0, -2 * k, 0) - np.roll(c0, 2 * k, 0)
+    nrm = np.stack([-t[:, 1], t[:, 0]], 1) / np.maximum(np.linalg.norm(t, axis=1, keepdims=True), 1e-9)
+    sc = 400.0 / max(H0, W0)
+    g = cv2.GaussianBlur(cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img, None,
+                                    fx=sc, fy=sc, interpolation=cv2.INTER_AREA), (0, 0), 1.5).astype(np.float32)
+    ms = cv2.resize(mask, g.shape[::-1], interpolation=cv2.INTER_NEAREST) > 0
+
+    def at(a, p):
+        q = np.clip(np.round(p * sc).astype(int), 0, [a.shape[1] - 1, a.shape[0] - 1])
+        return a[q[:, 1], q[:, 0]]
+    d0 = off[0] * W0
+    nrm[at(ms, c0 + d0 * nrm)] *= -1       # the "outside" probe landed on the sheet
+    inside = at(g, c0 - d0 * nrm)
+    for f in off:
+        ok &= np.abs(inside - at(g, c0 + f * W0 * nrm)) >= contrast
+    return c0, ok
+
+
+def sheet_sides(contour, to_frame, frame_size, *, block=None, reach=0.3, max_tilt=25.0, min_frac=0.15, step=12.0,
+                inset=2.0, max_rms=0.015):
+    """Paper-edge points of ``sheet_contour`` per side of a frame where the
+    sheet is roughly upright (e.g. the surface output): the contour is mapped
+    by ``to_frame`` (photo -> frame points, NaN off the frame), every point
+    whose tangent is within ``max_tilt`` deg of vertical (horizontal) is a
+    left / right (top / bottom) side point by its position to the sheet's
+    centre. A side must span ``min_frac`` of the frame's height (width).
+    ``block``: (x0, x1, y0, y1) of the printed block (staves / rows) in the
+    frame; side points then lie beside it, within ``reach`` of its size (not
+    the edge of a facing page or of a fold-over past its ends). A side whose
+    points scatter about a line by more than ``max_rms`` of its span is not
+    one straight edge and is dropped.
+    Returns {side: (N, 2) frame points ordered along the side, ~``step`` px apart}."""
+    if contour is None:
+        return {}
+    c0, ok = contour
+    q = to_frame(c0)
+    W, H = frame_size
+    fin = np.isfinite(q).all(1)
+    if fin.sum() < 50:
+        return {}
+    k = 8
+    t = np.roll(q, -k, 0) - np.roll(q, k, 0)
+    ang = np.degrees(np.arctan2(np.abs(t[:, 1]), np.abs(t[:, 0])))   # 90 = vertical
+    good = fin & np.isfinite(ang) & ok & np.roll(fin, k) & np.roll(fin, -k)
+    with np.errstate(invalid="ignore"):
+        good &= (q[:, 0] >= inset) & (q[:, 0] <= W - 1 - inset) & (q[:, 1] >= inset) & (q[:, 1] <= H - 1 - inset)
+        cx, cy = np.nanmedian(q[fin], 0)
+        vert, horz = ang >= 90 - max_tilt, ang <= max_tilt
+        sel = {"left": good & vert & (q[:, 0] < cx), "right": good & vert & (q[:, 0] > cx),
+               "top": good & horz & (q[:, 1] < cy), "bottom": good & horz & (q[:, 1] > cy)}
+        if block is not None:
+            x0, x1, y0, y1 = block
+            bw, bh = x1 - x0, y1 - y0
+            iny = (q[:, 1] >= y0 - 0.1 * bh) & (q[:, 1] <= y1 + 0.1 * bh)
+            inx = (q[:, 0] >= x0 - 0.05 * bw) & (q[:, 0] <= x1 + 0.05 * bw)
+            sel["left"] &= iny & (q[:, 0] < x0) & (q[:, 0] > x0 - reach * bw)
+            sel["right"] &= iny & (q[:, 0] > x1) & (q[:, 0] < x1 + reach * bw)
+            sel["top"] &= inx & (q[:, 1] < y0) & (q[:, 1] > y0 - reach * bh)
+            sel["bottom"] &= inx & (q[:, 1] > y1) & (q[:, 1] < y1 + reach * bh)
+    out = {}
+    for side, m in sel.items():
+        p = q[m]
+        ax = 1 if side in ("left", "right") else 0
+        if len(p) < 10 or np.ptp(p[:, ax]) < min_frac * (H if ax == 1 else W):
+            continue
+        kk, cc = np.polyfit(p[:, ax], p[:, 1 - ax], 1)
+        if np.sqrt(np.mean((p[:, 1 - ax] - cc - kk * p[:, ax]) ** 2)) > max_rms * np.ptp(p[:, ax]):
+            continue
+        p = p[np.argsort(p[:, ax])]
+        keep, last = [0], p[0, ax]
+        for i in range(1, len(p)):
+            if p[i, ax] - last >= step:
+                keep.append(i)
+                last = p[i, ax]
+        out[side] = p[keep]
+    return out
+
+
 def refine_page_mask(img: np.ndarray, rough: np.ndarray | None, structure_pts: np.ndarray,
                      work=480, iters=4, min_ratio=0.0):
     """GrabCut the sheet, seeded by what is known to be on it.
