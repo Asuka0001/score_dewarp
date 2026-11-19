@@ -99,6 +99,7 @@ class MetricConfig:
     page_seg_extent: bool = False    # also use the learned sheet mask in place of the brightness mask for the extent
     page_quad: bool = False          # with page_seg: page quad from the learned mask when the brightness quad fails
     rot90: bool = False              # turn the page by 90 degrees when its staves run vertically (_turned_staves)
+    main_page: bool = False          # crop the output to the main page: block + its print + margin (mainpage.py)
     page_select: bool = True         # with page_seg: drop the facing page of a two-page spread (pagenet.spread_cut)
     extent_fold: bool = False        # the output extent stops where the fitted surface folds over (GCSModel._unfolded)
     edge_prefit: bool = False        # with a learned sheet mask: its four sides are straight-line constraints of B
@@ -352,7 +353,7 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
     if cfg.pool != "width":
         raise ValueError(f"unknown pool mode {cfg.pool!r}")
     t0 = time.time()
-    base = replace(cfg, pool="off", output_res="canvas")
+    base = replace(cfg, pool="off", output_res="canvas", main_page=False)
     cands, results = [], []
     for w in cfg.pool_widths:
         r = _dewarp_single(img, replace(base, coarse_width=int(w)), False, page_src)
@@ -369,7 +370,7 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
         res = to_native(img, res)
         if paper is not None and paper.shape[:2] != res.image.shape[:2]:
             res.paper = cv2.resize(paper, res.bmap.out_size, interpolation=cv2.INTER_NEAREST)
-    return res
+    return _main_page(res, cfg)
 
 
 def _dewarp_single(img: np.ndarray, cfg: MetricConfig, verbose=False, page_src=None):
@@ -459,6 +460,8 @@ def _dewarp_single(img: np.ndarray, cfg: MetricConfig, verbose=False, page_src=N
         # sheet mask for the reading copy: only when it holds the content
         if mask is not None and stages.get("mask_holds_structures", 0) >= 0.97:
             paper_src = mask
+        elif cfg.main_page and sheet is not None and stages.get("page_seg", {}).get("holds", 0) >= 0.97:
+            paper_src = sheet   # no extent mask (crop_content): the learned sheet whitens the main page's rim
         extent = (model.page_extent(mask, edges=good, fold_check=cfg.extent_fold) if cfg.full_page
                   else model.content_extent())
         pts = None
@@ -509,6 +512,16 @@ def _dewarp_single(img: np.ndarray, cfg: MetricConfig, verbose=False, page_src=N
         res = to_native(img, res)
     if paper_src is not None:
         res.paper = (res.bmap.apply(paper_src, interp=cv2.INTER_LINEAR, value=0) > 127).astype(np.uint8) * 255
+    return _main_page(res, cfg, sheet)
+
+
+def _main_page(res, cfg, sheet=None):
+    if not cfg.main_page:
+        return res
+    from .mainpage import main_page
+    t = time.time()
+    res = main_page(res, sheet)
+    res.timings["main_page"] = time.time() - t
     return res
 
 

@@ -707,6 +707,55 @@ def scale_structures(S: Structures, s: float) -> Structures:
     return T
 
 
+def crop_structures(S: Structures, x0: float, y0: float, x1: float, y1: float) -> Structures:
+    """Structures on the crop [x0, x1) x [y0, y1) of their canvas, in the crop's
+    pixels. Staves and rows whose centre lies outside the crop are dropped
+    (their fragments become free lines, their noteheads are removed)."""
+    import copy
+    T = copy.deepcopy(S)
+    d = np.array([-x0, -y0], float)
+    T.shape = (int(round(y1 - y0)), int(round(x1 - x0)))
+    inside = lambda x, y: x0 <= x < x1 and y0 <= y < y1  # noqa: E731
+    for f in T.fragments:
+        f.pts = f.pts + d
+    for v in T.vsegs:
+        v.pts = v.pts + d
+    keep = []
+    for st in T.staves:
+        c = np.mean([t.mean(0) for t in st.tuples], 0) if len(st.tuples) else None
+        keep.append(c is not None and inside(*c))
+        st.tuples = [t + d for t in st.tuples]
+        st.x_range = (st.x_range[0] - x0, st.x_range[1] - x0)
+        for name in ("top_poly", "bot_poly"):
+            c = getattr(st, name)
+            if c is not None:   # y' = f(x' + x0) - y0
+                q = (np.poly1d(c)(np.poly1d([1.0, float(x0)])) - float(y0)).coeffs
+                setattr(st, name, np.concatenate([np.zeros(len(c) - len(q)), q]))
+    new = np.cumsum(keep) - 1
+    for f in T.fragments:
+        if f.staff >= 0:
+            f.staff, f.line = (int(new[f.staff]), f.line) if keep[f.staff] else (-1, -1)
+    T.staves = [st for st, k in zip(T.staves, keep) if k]
+    rows = []
+    for r in T.rows:
+        for b in r.blobs:
+            b.x0, b.y0, b.x1, b.y1 = b.x0 - x0, b.y0 - y0, b.x1 - x0, b.y1 - y0
+        if r.blobs and inside(np.median([b.cx for b in r.blobs]) + x0, np.median([b.cy for b in r.blobs]) + y0):
+            rows.append(r)
+    T.rows = rows
+    T.regions = [(t, np.asarray(p, float) + d) for t, p in S.regions]
+    if S.heads is not None and len(S.heads):
+        h = S.heads.copy()
+        h[:, :2] += d
+        si = h[:, 3].astype(int)
+        ok = (si >= 0) & (si < len(keep))
+        ok[ok] &= np.asarray(keep)[si[ok]]
+        h = h[ok]
+        h[:, 3] = new[h[:, 3].astype(int)]
+        T.heads = h
+    return T
+
+
 def _learned_staves(seg, ink, thick, W, robust):
     """Staves from the network's staff-line mask (``learned.masks``).
 

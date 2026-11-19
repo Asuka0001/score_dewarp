@@ -234,7 +234,11 @@ def spread_cut(S, *, min_gap=0.03, min_side=0.15, tilts=np.radians(np.arange(-12
     it = _items(S)
     if len(it) < 3:
         return None
-    W = S.shape[1]
+    return gutter(it, S.shape[1], min_gap=min_gap, min_side=min_side, tilts=tilts)
+
+
+def gutter(it, W, *, min_gap=0.03, min_side=0.15, tilts=np.radians(np.arange(-12, 12.1, 1.0))):
+    """``spread_cut`` on items (x0, x1, y, weight) of a canvas of width ``W``."""
     tot = it[:, 3].sum()
     best = None
     for a in tilts:

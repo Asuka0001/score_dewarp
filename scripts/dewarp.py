@@ -56,6 +56,9 @@ def main():
                     help="metric: do not turn pages whose staves run vertically (photo taken sideways)")
     ap.add_argument("--crop-content", action="store_true",
                     help="metric: output only the detected content box instead of the whole page")
+    ap.add_argument("--keep-surroundings", action="store_true",
+                    help="metric: keep the facing page, paper rim and background around the main page "
+                         "(by default the output is cropped to the main page's print plus a white margin)")
     ap.add_argument("--binary", action="store_true", help="also write a black/white reading copy")
     ap.add_argument("--paper", choices=("a4", "a3", "letter", "custom", "adaptive"), default="a4",
                     help="output paper; adaptive preserves the rectified canvas")
@@ -88,7 +91,7 @@ def main():
                 preset["seg"] = args.seg
             cfg = MetricConfig(**{**preset, "residual": "none" if args.no_field else MetricConfig.residual,
                                   "full_page": not args.crop_content, "output_res": args.output_res,
-                                  "rot90": not args.no_rotate})
+                                  "rot90": not args.no_rotate, "main_page": not args.keep_surroundings})
             res = dewarp_metric(img, cfg)
         else:
             res = dewarp(img, Config(use_field=not args.no_field))
@@ -97,7 +100,10 @@ def main():
         base = os.path.join(args.out, name)
         cv2.imwrite(base + "_rectified.png", res.image)
         sp = getattr(res.structures, "spacing_est", None)
-        paper = paper_region(res.paper, res.image, spacing=sp, content=getattr(res, "content", None))
+        if "whitened" in res.stages.get("main_page", {}):
+            paper = res.paper   # main-page mask: sheet, block and the page's print only
+        else:
+            paper = paper_region(res.paper, res.image, spacing=sp, content=getattr(res, "content", None))
         reading = clean_page(res.image, paper, sp)
         cv2.imwrite(base + "_enhanced.png", reading)
         binary = None
