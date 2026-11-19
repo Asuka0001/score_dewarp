@@ -119,7 +119,17 @@ def main():
     ap.add_argument("--per-split", type=int, default=120)
     ap.add_argument("--seed", type=int, default=20261117)
     ap.add_argument("--size", type=int, default=1600)
+    ap.add_argument("--splits", nargs="+", default=["dev", "test"],
+                    help="dev / test, or tune: dev-side deformations whose mesh group is not used by --exclude")
+    ap.add_argument("--exclude", type=Path, default=None,
+                    help="existing bench root; its samples' Doc3D groups are not used again (for --splits tune)")
     args = ap.parse_args()
+    used, used_ds = set(), set()
+    if args.exclude is not None:
+        for g in args.exclude.glob("*/*/gt.json"):
+            meta = json.loads(g.read_text())["meta"]
+            used.add(meta["doc3d_group"])
+            used_ds.add(meta.get("source_file"))
     if args.out.exists() and any(args.out.iterdir()):
         raise SystemExit(f"Output must be empty: {args.out}")
     rng = np.random.default_rng(args.seed)
@@ -146,17 +156,21 @@ def main():
     ds_iter = iter(order)
     kinds = ["deepscores", "staff", "jianpu", "mixed", "deepscores"]  # 40% real engraving
     manifest = {"seed": args.seed, "size": args.size, "tier_cuts": cuts.tolist(), "samples": []}
-    for split in ("dev", "test"):
-        cand = [p for p in pool if p["split"] == split]
+    for split in args.splits:
+        side = "dev" if split == "tune" else split
+        cand = [p for p in pool if p["split"] == side and p["group"] not in used]
         pick = rng.permutation(len(cand))[:args.per_split]
         for i, j in enumerate(pick):
             p = cand[j]
             kind = kinds[i % len(kinds)]
-            sample_rng = np.random.default_rng([args.seed, i, 0 if split == "dev" else 1])
+            sample_rng = np.random.default_rng([args.seed, i, {"dev": 0, "test": 1}.get(split, 2)])
             if kind == "deepscores":
                 res = None
                 while res is None:
-                    res = deepscores_flat(images[next(ds_iter)], anns, head_cats)
+                    rec = images[next(ds_iter)]
+                    if rec["filename"] in used_ds:
+                        continue
+                    res = deepscores_flat(rec, anns, head_cats)
                 flat, flat_ann, extra = res
                 meta = {"kind": "staff", "flat_source": "deepscores", **extra}
             else:

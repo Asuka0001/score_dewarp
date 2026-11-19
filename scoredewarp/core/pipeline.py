@@ -54,22 +54,55 @@ class Result:
         return self.bmap.forward_points(pts)
 
 
+def drop_rim(norm, valid, near=12.0, frac=0.8):
+    """Sheet mask minus the ink blobs that lie along its border.
+
+    A learned sheet mask is upsampled from a coarse map, so its jagged border
+    often takes in a thin sliver of the dark background; binarised, the
+    sliver becomes rows of false strokes and lines along the paper edge
+    (dev 0109: 205 -> 338 vertical strokes, weight 5 in B). Blobs (global or
+    local threshold) that touch the mask border and keep >= ``frac`` of their
+    pixels within ``near`` px of it are removed from the mask. The photo frame
+    is not a mask border (a page cut by the frame keeps its content)."""
+    H, W = valid.shape
+    block = max(15, min(H, W) // 50) | 1
+    ink = binarize(norm, valid) | (cv2.adaptiveThreshold(norm, 1, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                                         cv2.THRESH_BINARY_INV, block, 5) & valid)
+    pad = cv2.copyMakeBorder(valid, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=1)
+    dist = cv2.distanceTransform(pad, cv2.DIST_L2, 3)[1:-1, 1:-1]
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    if n < 2:
+        return valid
+    touch = np.zeros(n, bool)
+    touch[np.unique(lab[(ink > 0) & (dist <= 2.0)])] = True
+    near_n = np.bincount(lab[(ink > 0) & (dist <= near)], minlength=n)
+    bad = touch & (near_n >= frac * np.maximum(stats[:, cv2.CC_STAT_AREA], 1))
+    bad[0] = False
+    if not bad.any():
+        return valid
+    return (valid & ~bad[lab]).astype(np.uint8)
+
+
 def _detect(img, *, robust=True, local_lines=False, merge_rows=False, stem_refine=False, seg=None,
-            seg_parts=None, stem_bridge=True, page=None, seg_fuse="page"):
+            seg_parts=None, stem_bridge=True, page=None, seg_fuse="page", rim=False, jp_rows="chain",
+            glyph="template"):
     """``seg``: learned class map (``learned.segment``) already warped onto ``img``.
     ``page``: uint8 sheet mask warped onto ``img`` (>127 = on the sheet); when
     given, only ink on the sheet is evidence (background clutter -- wood grain,
-    brick, cloth folds -- otherwise yields free lines, strokes and text rows)."""
+    brick, cloth folds -- otherwise yields free lines, strokes and text rows).
+    ``rim``: also drop background slivers along the mask border (``drop_rim``)."""
     norm = normalize_illumination(to_gray(img))
     valid = None if page is None else (page > 127).astype(np.uint8)
     if valid is not None and valid.mean() < 0.05:
         valid = None
+    if valid is not None and rim:
+        valid = drop_rim(norm, valid)
     ink = binarize(norm, valid=valid)
     from .learned import masks
     return norm, ink, detect_structures(norm, ink, robust=robust, local_lines=local_lines, merge_rows=merge_rows,
                                         stem_refine=stem_refine,
                                         seg=masks(seg, ink.shape, parts=seg_parts, stem_bridge=stem_bridge),
-                                        valid=valid, fuse=seg_fuse)
+                                        valid=valid, fuse=seg_fuse, jp_rows=jp_rows, glyph=glyph)
 
 
 def _warp_seg(bm, seg_src):
@@ -224,7 +257,8 @@ def refine_dewarp(img: np.ndarray, initial_map: BackwardMap, cfg: Config | None 
 
 def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_rows=False,
             keep_pts=None, margin=0.0, stem_refine=False, seg_src=None,
-            seg_parts=None, stem_bridge=True, seg_final="same", page_src=None, seg_fuse="page"):
+            seg_parts=None, stem_bridge=True, seg_final="same", page_src=None, seg_fuse="page", page_rim=False,
+            jp_rows="chain", glyph="template"):
     """``keep_pts``: outline points of all printed content on ``cur``; the
     residual keeps them on its canvas, and the output is padded with white so
     that they keep ``margin`` (fraction of the content width) to every border."""
@@ -254,7 +288,8 @@ def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_
             _, _, S2 = _detect(cur, robust=False, local_lines=local_lines, merge_rows=merge_rows,
                                seg=_warp_seg(bm, seg_src),
                                seg_parts=seg_parts, stem_bridge=stem_bridge,
-                               stem_refine=stem_refine, page=_warp_mask(bm, page_src), seg_fuse=seg_fuse)
+                               stem_refine=stem_refine, page=_warp_mask(bm, page_src), seg_fuse=seg_fuse,
+                               rim=page_rim, jp_rows=jp_rows, glyph=glyph)
             S2f = _filter_structures(S2, cfg.field_priors)
             kw = {**(cfg.field_kw or {}), **((cfg.field_kw_type or {}).get(S2.page_type, {}))}
             fb = fit_field(S2f, node=cfg.field_node, priors=cfg.field_priors, keep_pts=keep_pts, **kw)
@@ -266,6 +301,13 @@ def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_
                 break
             if keep_pts is not None:
                 keep_pts = fb.forward(keep_pts)
+            UV = getattr(fb, "forward_nodes", None)
+            if UV is not None:   # field work beyond a shift, in staff / glyph spacings (pool verifier)
+                g = np.stack(np.meshgrid(np.arange(UV.shape[1]), np.arange(UV.shape[0])), -1) * float(cfg.field_node)
+                d = (UV - g).reshape(-1, 2)
+                d -= d.mean(0)
+                sp = S2.spacing_est if S2.spacing_est else 10.0
+                stages.setdefault("field_disp", []).append(float(np.sqrt((d ** 2).sum(1).mean()) / max(sp, 1.0)))
             sc = stages.setdefault("field_scale", [1.0, 1.0])   # product over iterations
             fs = getattr(fb, "field_scale", (1.0, 1.0))
             stages["field_scale"] = [sc[0] * fs[0], sc[1] * fs[1]]
@@ -295,7 +337,7 @@ def _finish(img, cur, bm, cfg, stages, T, t0, verbose, local_lines=False, merge_
         seg_final = seg_src
     norm, ink, Sf = _detect(cur, merge_rows=merge_rows, stem_refine=stem_refine, seg=_warp_seg(bm, seg_final),
                            seg_parts=seg_parts, stem_bridge=stem_bridge, page=_warp_mask(bm, page_src),
-                           seg_fuse=seg_fuse)
+                           seg_fuse=seg_fuse, rim=page_rim, jp_rows=jp_rows, glyph=glyph)
     enhanced = norm
     T["final_detect"] = time.time() - t
     T["total"] = time.time() - t0

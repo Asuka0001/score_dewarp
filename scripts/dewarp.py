@@ -52,6 +52,8 @@ def main():
                     help="metric: small detection models (geometry stays the solver): page = U2-Netp sheet "
                          "segmentation (sheet mask, page quad, surface selection by the sheet outline); "
                          "all = page + homr staff lines. Weights in models/")
+    ap.add_argument("--no-rotate", action="store_true",
+                    help="metric: do not turn pages whose staves run vertically (photo taken sideways)")
     ap.add_argument("--crop-content", action="store_true",
                     help="metric: output only the detected content box instead of the whole page")
     ap.add_argument("--binary", action="store_true", help="also write a black/white reading copy")
@@ -85,7 +87,8 @@ def main():
             if args.seg != "off":
                 preset["seg"] = args.seg
             cfg = MetricConfig(**{**preset, "residual": "none" if args.no_field else MetricConfig.residual,
-                                  "full_page": not args.crop_content, "output_res": args.output_res})
+                                  "full_page": not args.crop_content, "output_res": args.output_res,
+                                  "rot90": not args.no_rotate})
             res = dewarp_metric(img, cfg)
         else:
             res = dewarp(img, Config(use_field=not args.no_field))

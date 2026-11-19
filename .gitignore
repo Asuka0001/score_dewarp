@@ -5,3 +5,4 @@ __pycache__/
 *.pt
 .DS_Store
 .Rhistory
+models/glyph/_train_cache.npz

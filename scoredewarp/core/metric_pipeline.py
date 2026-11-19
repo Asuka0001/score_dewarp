@@ -48,7 +48,16 @@ DEFAULT_WEIGHTS = {"vseg": 5.0}
 # tuples stop short of the ends and split staves broke the chain, so the
 # margins kept a slant / keystone (the "top wide, bottom narrow" CPMS pages).
 DEFAULT_FIELD = {"tuple_u": 0.0, "vseg_w": 4.0, "lam_u": 3.0, "lam_v": 0.5, "spacing_gate": 9.0, "ends_w": 2.0,
-                 "ends_mode": "rows", "keep_scale": True, "anchor": True, "guard": True}
+                 "ends_mode": "rows", "keep_scale": True, "anchor": True, "guard": True,
+                 # lengths along staves / jianpu rows from glyph widths (noteheads, same-class digits), not from the
+                 # vertical spacing: dev 2026-11-19 ad_c median 0.875 -> 0.742, 72 better / 25 worse
+                 "h_ruler": "glyph",
+                 # with a true horizontal ruler the jianpu row lengths deserve weight next to the vertical strokes
+                 # (jianpu + mixed dev 48: ad_c 37 better / 5 worse; 8.0 saturates); lyric / text rows keep 0.3
+                 "row_u": 3.0, "text_u": 0.3,
+                 # the text block's sides are straight lines on the flat page: staff row ends + jianpu final
+                 # barlines (block_jp) share one U per side, also along the segments between rows (edge_w)
+                 "block_jp": True, "edge_w": 2.0}
 DEFAULT_FIELD_TYPE = {"jianpu": {"vseg_w": 8.0}, "mixed": {"lam_u": 1.5}}   # on top of DEFAULT_FIELD
 
 
@@ -59,6 +68,8 @@ class MetricConfig:
     local_lines: bool = True
     stem_refine: bool = True         # vertical strokes re-centred on their thin part (no notehead / flag pull)
     gcs_ends: str = "all"            # all: every outer-line fragment end | rows: only each staff row's outer ends
+    jp_rows: str = "chain"           # chain | digit: jianpu note rows chained from digit blobs first
+    glyph: str = "template"          # template | cnn: digit classifier for jp_rows=digit (core/glyphnet.py)
     merge_rows: bool = False         # join jianpu / text row pieces split by wide gaps
     adaptive_scale: str = "staff"   # staff: upscale when detected staves are small | off
     full_page: bool = True
@@ -83,9 +94,11 @@ class MetricConfig:
     seg_fuse: str = "page"           # page: learned or classical staves per page (by line length) | staff: per staff
     seg_stages: str = "bcf"          # where the learned masks are used: b surface fit, c residual field, f final output
     page_seg: str = "off"            # off | u2netp: learned sheet mask, evidence only on the sheet (core/pagenet.py)
+    page_rim: bool = True            # with a sheet mask: drop background slivers along its border (pipeline.drop_rim)
     page_erode: float = 0.01         # sheet mask eroded by this fraction of the photo width (paper rim, shadow edge)
     page_seg_extent: bool = False    # also use the learned sheet mask in place of the brightness mask for the extent
     page_quad: bool = False          # with page_seg: page quad from the learned mask when the brightness quad fails
+    rot90: bool = False              # turn the page by 90 degrees when its staves run vertically (_turned_staves)
     page_select: bool = True         # with page_seg: drop the facing page of a two-page spread (pagenet.spread_cut)
     extent_fold: bool = False        # the output extent stops where the fitted surface folds over (GCSModel._unfolded)
     edge_prefit: bool = False        # with a learned sheet mask: its four sides are straight-line constraints of B
@@ -95,6 +108,12 @@ class MetricConfig:
     b_select: str = "cost"           # cost | outline | outline_margin: with a learned sheet mask, finish both ruling
                                      # starts, keep the most rectangular sheet outline (GCSModel.select_by_outline);
                                      # outline_margin also wants constant page margins to the staff block
+    pool: str = "off"                # off | width: run the whole pipeline at each of ``pool_widths`` (the B fit
+                                     # lands in a different local minimum on ~1 page in 4 when the coarse frame
+                                     # moves by 1 %) and keep the run whose residual field C had the least work
+                                     # to do: C absorbs what B got wrong, so its total displacement is a GT-free
+                                     # error estimate of B (tune: mean AD_c -11 %, big gains 12 vs big losses 1)
+    pool_widths: tuple = (1600, 1584, 1616)
     field_iters: int = 3
     fit_kw: dict = None
     weights: dict = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
@@ -110,6 +129,18 @@ def _coarse_homography(img, quad, width):
     return np.diag([sc, sc, 1.0]), (int(W0 * sc), int(H0 * sc))
 
 
+def _turned_staves(I1, ratio=2.0):
+    """True when staff lines run vertically: the staves found on the image
+    turned by 90 degrees are much longer than those found as is. Only staves
+    vote (jianpu digit rows are found in both directions); the image is left as
+    is when neither direction has staves. 180 degrees is not decided."""
+    def length(im):
+        _, _, S = _detect(im, robust=False)
+        return float(sum(s.x_range[1] - s.x_range[0] for s in S.staves))
+    turned = length(np.ascontiguousarray(np.rot90(I1, -1)))
+    return turned > 0 and turned > ratio * length(I1)
+
+
 def coarse(img, cfg, sal=None, stages=None):
     """``sal``: learned saliency map (``pagenet.saliency``); with
     ``cfg.page_quad`` its page quadrilateral replaces a missing brightness quad."""
@@ -121,7 +152,11 @@ def coarse(img, cfg, sal=None, stages=None):
             stages["quad_source"] = "pagenet" if quad is not None else None
     Hq, size = _coarse_homography(img, quad, cfg.coarse_width)
     I1 = cv2.warpPerspective(img, Hq, size, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    ang, r90 = estimate_skew(binarize(normalize_illumination(to_gray(I1))))
+    r90 = cfg.rot90 and _turned_staves(I1)
+    if stages is not None and cfg.rot90:
+        stages["rot90"] = bool(r90)
+    I1r = np.ascontiguousarray(np.rot90(I1, -1)) if r90 else I1
+    ang, _ = estimate_skew(binarize(normalize_illumination(to_gray(I1r))))
     R, size = rotation_homography(ang, size, r90)
     Hc = R @ Hq
     I1 = cv2.warpPerspective(img, Hc, size, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
@@ -140,7 +175,8 @@ def detect_at_scale(img, Hc, size, I1, cfg, stages, seg_src=None, page_src=None)
     _, _, S = _detect(I1, robust=cfg.robust_detect, local_lines=cfg.local_lines, merge_rows=cfg.merge_rows,
                       stem_refine=cfg.stem_refine, seg=_warp_seg(BackwardMap.from_homography(Hc, size), seg_src),
                       seg_parts=cfg.seg_parts, stem_bridge=cfg.stem_bridge,
-                      page=_warp_mask(BackwardMap.from_homography(Hc, size), page_src), seg_fuse=cfg.seg_fuse)
+                      page=_warp_mask(BackwardMap.from_homography(Hc, size), page_src), seg_fuse=cfg.seg_fuse,
+                      rim=cfg.page_rim, jp_rows=cfg.jp_rows, glyph=cfg.glyph)
     if cfg.adaptive_scale != "off" and S.staves:
         sp = float(np.median([st.spacing for st in S.staves]))
         if sp < 9:
@@ -152,7 +188,8 @@ def detect_at_scale(img, Hc, size, I1, cfg, stages, seg_src=None, page_src=None)
                               stem_refine=cfg.stem_refine,
                               seg=_warp_seg(BackwardMap.from_homography(Hc, size), seg_src),
                               seg_parts=cfg.seg_parts, stem_bridge=cfg.stem_bridge,
-                              page=_warp_mask(BackwardMap.from_homography(Hc, size), page_src), seg_fuse=cfg.seg_fuse)
+                              page=_warp_mask(BackwardMap.from_homography(Hc, size), page_src), seg_fuse=cfg.seg_fuse,
+                      rim=cfg.page_rim, jp_rows=cfg.jp_rows, glyph=cfg.glyph)
             stages["coarse_upscale"] = f
     return Hc, size, I1, S
 
@@ -295,14 +332,47 @@ def _surface(img, cfg, stages, T, Hc, size, I1, seg_b, page_src, sal):
                 mg = model.margin_score(q)
                 sc = sc + mg if np.isfinite(mg) else sc
             score = sc if np.isfinite(sc) else None
+        elif sheet is not None:
+            from .pagenet import outline_points
+            q = outline_points(sheet)
+            sc = model.outline_score(q) if q is not None else float("nan")
+            score = sc if np.isfinite(sc) else None
+        stages["outline_score"] = score
     return {"Hc": Hc, "size": size, "I1": I1, "S1": S1, "sheet": sheet, "page_src": page_src, "model": model,
             "n": n, "outline_score": score}
 
 
 def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=False, page_src=None):
     """``page_src``: optional uint8 sheet mask on the photo (255 = sheet); the
-    detector then only takes evidence on the sheet."""
+    detector then only takes evidence on the sheet. ``cfg.pool="width"``: see
+    ``MetricConfig.pool``."""
     cfg = cfg or MetricConfig()
+    if cfg.pool == "off":
+        return _dewarp_single(img, cfg, verbose, page_src)
+    if cfg.pool != "width":
+        raise ValueError(f"unknown pool mode {cfg.pool!r}")
+    t0 = time.time()
+    base = replace(cfg, pool="off", output_res="canvas")
+    cands, results = [], []
+    for w in cfg.pool_widths:
+        r = _dewarp_single(img, replace(base, coarse_width=int(w)), False, page_src)
+        fd = r.stages.get("field_disp")
+        cands.append({"width": int(w), "disp": float(sum(fd)) if fd else None})
+        results.append(r)
+    disp = [np.inf if c["disp"] is None else c["disp"] for c in cands]
+    k = int(np.argmin(disp))     # ties (no field anywhere) keep the first width
+    res = results[k]
+    res.stages["pool"] = {"candidates": cands, "selected": k}
+    res.timings["pool_total"] = time.time() - t0
+    if cfg.output_res == "native":
+        paper = res.paper
+        res = to_native(img, res)
+        if paper is not None and paper.shape[:2] != res.image.shape[:2]:
+            res.paper = cv2.resize(paper, res.bmap.out_size, interpolation=cv2.INTER_NEAREST)
+    return res
+
+
+def _dewarp_single(img: np.ndarray, cfg: MetricConfig, verbose=False, page_src=None):
     t0 = time.time()
     T, stages = {}, {"model": "gcs"}
     H0, W0 = img.shape[:2]
@@ -408,8 +478,16 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
         stages["surface_rejected"] = True
     T["surface"] = time.time() - t
 
+    field_kw = cfg.field_kw
+    if n >= 20 and len(getattr(model, "staff_groups", ())) > 1:
+        # staves of more than one printed size on the photo (violin above
+        # piano): the field keeps the sizes apart as well. Decided here, on the
+        # photo, not on the surface output, where a badly stretched page shows
+        # one size at two spacings (dev 0091 / 0111 / 0115).
+        field_kw = {**(field_kw or {}), "size_classes": True}
+        stages["staff_sizes"] = len(model.staff_groups)
     legacy = Config(use_field=cfg.residual == "field", use_line_mesh=cfg.residual == "mesh",
-                    field_iters=cfg.field_iters, field_kw=cfg.field_kw,
+                    field_iters=cfg.field_iters, field_kw=field_kw,
                     field_kw_type=cfg.field_type)
     if cfg.residual == "mesh":
         legacy = replace(legacy, use_field=True)  # field remains the fallback for non-staff pages
@@ -420,7 +498,8 @@ def dewarp_metric(img: np.ndarray, cfg: MetricConfig | None = None, verbose=Fals
                   margin=cfg.margin if cfg.ink_extent else 0.0, stem_refine=cfg.stem_refine,
                   seg_src=seg_src if "c" in cfg.seg_stages else None,
                   seg_final=seg_src if "f" in cfg.seg_stages else None,
-                  seg_parts=cfg.seg_parts, stem_bridge=cfg.stem_bridge, page_src=page_src, seg_fuse=cfg.seg_fuse)
+                  seg_parts=cfg.seg_parts, stem_bridge=cfg.stem_bridge, page_src=page_src, seg_fuse=cfg.seg_fuse,
+                  page_rim=cfg.page_rim, jp_rows=cfg.jp_rows, glyph=cfg.glyph)
     if cfg.rectify_margins:
         res = rectify_margins(img, res, cfg)
     ms = margin_stats(res.structures)

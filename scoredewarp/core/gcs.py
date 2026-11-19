@@ -31,7 +31,7 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.sparse import lil_matrix
 
-from .structures import Structures
+from .structures import Structures, spacing_classes
 from .transforms import BackwardMap
 
 K_KNOTS = 13
@@ -125,6 +125,9 @@ class GCSModel:
         for (_, side, _), e in row_ends.items():
             ends[side].append(e)
         self.staff_s = staff_s
+        # equal spacing only among staves of one printed size (spacing_classes)
+        cls = spacing_classes([st.spacing for st in S.staves])
+        self.staff_groups = [[staff_s[i] for i in np.flatnonzero(cls == c)] for c in np.unique(cls)]
         # photo points of the staff block, for the margin check of a solution
         # (margin_score): per staff row its line pieces, sampled
         rows = _staff_rows(S.staves)
@@ -246,7 +249,8 @@ class GCSModel:
         th = p[7:7 + K_KNOTS]
         pri = [np.diff(th, 2) * self.lam_curv, th * self.lam_th, [th[K_KNOTS // 2] * 200.0]]
         u = self.unit
-        for grp, lam in ((self.staff_s, self.lam_sp), (self.jp_h, self.lam_h)):
+        groups = getattr(self, "staff_groups", [self.staff_s])
+        for grp, lam in [(g, self.lam_sp) for g in groups] + [(self.jp_h, self.lam_h)]:
             if len(grp) > 1:
                 v = p[grp]
                 pri.append((v - np.median(v)) * u * lam)

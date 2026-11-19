@@ -88,6 +88,7 @@ class Structures:
     vsegs: list
     page_type: str = "unknown"
     regions: list = field(default_factory=list)   # (type, polygon (4,2))
+    heads: np.ndarray = None   # (N,4) filled noteheads: cx, cy, width (moment-based), staff index
 
     def summary(self):
         return {
@@ -423,6 +424,34 @@ def staff_band_mask(shape, staves, margin_sp=2.6):
     return m
 
 
+def find_noteheads(ink, staves, sp):
+    """Filled noteheads: every one is the same printed glyph, so their flat
+    widths are equal everywhere on the page -- a horizontal ruler (staff
+    spacing is only a vertical one). An opening with a disk thicker than staff
+    lines, stems and beams leaves the head bodies; chords / seconds merge into
+    blobs of the wrong size and are dropped. Returns (N,4): cx, cy, width, staff."""
+    if not staves or not sp:
+        return np.zeros((0, 4))
+    d = max(3, int(round(0.65 * sp)))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (d, d))
+    band = staff_band_mask(ink.shape, staves, margin_sp=1.5)
+    op = cv2.morphologyEx((ink & band).astype(np.uint8), cv2.MORPH_OPEN, k)
+    n, lab, stats, cent = cv2.connectedComponentsWithStats(op, connectivity=8)
+    out = []
+    for i in range(1, n):
+        x, y, w, h, a = stats[i]
+        if not (0.7 * sp <= h <= 1.5 * sp and 0.9 * sp <= w <= 2.0 * sp and a >= 0.6 * w * h):
+            continue
+        cx, cy = cent[i]
+        dist = [abs(cy - _staff_mid(st, cx)) / st.spacing for st in staves]
+        j = int(np.argmin(dist))
+        if dist[j] > 4.0:
+            continue
+        xs = np.nonzero(lab[y:y + h, x:x + w] == i)[1]
+        out.append((cx, cy, 4.0 * float(np.sqrt(xs.var() + 1 / 12)), j))   # full width of an ellipse = 4 sigma_x
+    return np.array(out, float).reshape(-1, 4)
+
+
 def _merge_chains(chains, B, max_gap=10.0, max_dy=0.9, max_ratio=1.6):
     """Join row pieces split by wide gaps (jianpu "5 - - |", rests, lyrics with
     blanks), dots or underlines: the longer piece's centre line, extrapolated
@@ -483,7 +512,38 @@ def _merge_chains(chains, B, max_gap=10.0, max_dy=0.9, max_ratio=1.6):
     return chains
 
 
-def find_text_rows(ink, line_len, band, *, reject_boxes=True, merge_rows=False):
+def _chain_blobs(B, max_gap=5.0, max_ratio=2.0):
+    """Chains of blobs (rows of ``B``: x0, y0, x1, y1) by mutual nearest right
+    neighbours with vertical overlap; returns lists of row indices of ``B``."""
+    hh = B[:, 3] - B[:, 1]
+    cx = (B[:, 0] + B[:, 2]) / 2
+    gap = B[None, :, 0] - B[:, None, 2]                         # x0_j - x1_i
+    ov = np.minimum(B[:, None, 3], B[None, :, 3]) - np.maximum(B[:, None, 1], B[None, :, 1])
+    mh = np.minimum(hh[:, None], hh[None, :])
+    Mh = np.maximum(hh[:, None], hh[None, :])
+    ok = (cx[None, :] > cx[:, None]) & (gap > -0.25 * mh) & (gap < max_gap * Mh) & (ov > 0.5 * mh) & (Mh < max_ratio * mh)
+    dist = np.where(ok, cx[None, :] - cx[:, None], np.inf)
+    right = np.where(np.isfinite(dist.min(1)), dist.argmin(1), -1)
+    left = np.where(np.isfinite(dist.min(0)), dist.argmin(0), -1)
+    nxt = {i: int(right[i]) for i in range(len(B)) if right[i] >= 0 and left[right[i]] == i}
+    has_prev = set(nxt.values())
+    chains = []
+    for i in range(len(B)):
+        if i in has_prev:
+            continue
+        chain = [i]
+        while chain[-1] in nxt:
+            chain.append(nxt[chain[-1]])
+        chains.append(chain)
+    return chains
+
+
+def find_text_rows(ink, line_len, band, *, reject_boxes=True, merge_rows=False, digit_first=False,
+                   classifier="template"):
+    """Jianpu note rows and text rows from glyph blobs. ``digit_first``: note
+    rows are chained from digit blobs alone before the other glyphs are
+    chained into text rows. ``classifier``: crop -> (digit or None, score),
+    default ``classify_digit`` (templates)."""
     # remove only pixels belonging to long, strictly horizontal runs (underlines,
     # 减时线, ledger/staff remnants) without eroding the glyphs touching them
     lines = directional_open(ink, line_len, True, angles=(-2, 0, 2), thicken=False)
@@ -511,30 +571,39 @@ def find_text_rows(ink, line_len, band, *, reject_boxes=True, merge_rows=False):
     if len(blobs) < 3:
         return [], h_mode
     B = np.array([[b.x0, b.y0, b.x1, b.y1] for b in blobs])
-    hh = B[:, 3] - B[:, 1]
-    cx = (B[:, 0] + B[:, 2]) / 2
-    # pairwise right-neighbour search
-    gap = B[None, :, 0] - B[:, None, 2]                         # x0_j - x1_i
-    ov = np.minimum(B[:, None, 3], B[None, :, 3]) - np.maximum(B[:, None, 1], B[None, :, 1])
-    mh = np.minimum(hh[:, None], hh[None, :])
-    Mh = np.maximum(hh[:, None], hh[None, :])
-    ok = (cx[None, :] > cx[:, None]) & (gap > -0.25 * mh) & (gap < 5.0 * Mh) & (ov > 0.5 * mh) & (Mh < 2.0 * mh)
-    dist = np.where(ok, cx[None, :] - cx[:, None], np.inf)
-    right = np.where(np.isfinite(dist.min(1)), dist.argmin(1), -1)
-    left = np.where(np.isfinite(dist.min(0)), dist.argmin(0), -1)
-    nxt = {i: int(right[i]) for i in range(len(blobs)) if right[i] >= 0 and left[right[i]] == i}
-    has_prev = set(nxt.values())
-    chains = []
-    for i in range(len(blobs)):
-        if i in has_prev:
-            continue
-        chain = [i]
-        while chain[-1] in nxt:
-            chain.append(nxt[chain[-1]])
-        chains.append(chain)
-    if merge_rows:
-        chains = _merge_chains(chains, B)
     rows = []
+    rest = np.arange(len(blobs))
+    if digit_first:
+        # jianpu note rows first, from digit blobs only: a lyric row of the
+        # same glyph size right below otherwise captures the chain (nearest
+        # right neighbour jumps between the two rows), the mixed row fails the
+        # digit-fraction test and the page loses its jianpu prior
+        # (dev 2026-11-19: 110 / 297 GT note rows not found as jianpu rows).
+        crops = [lab[int(b.y0):int(b.y1), int(b.x0):int(b.x1)] == b._lab for b in blobs]
+        if classifier == "cnn":
+            from .glyphnet import classify
+            res = classify(crops, thr=0.6)
+        else:
+            res = [classify_digit(c, reject_boxes=reject_boxes) for c in crops]
+        for b, (d, _) in zip(blobs, res):
+            b.digit = d
+        dig = np.array([b.digit is not None for b in blobs])
+        D = np.flatnonzero(dig)
+        used = np.zeros(len(blobs), bool)
+        if len(D) >= 3:
+            ch = _merge_chains([list(D[c]) for c in _chain_blobs(B[D], max_gap=6.0, max_ratio=1.5)], B)
+            for chain in ch:
+                if len(chain) < 3:
+                    continue
+                rb = sorted([blobs[k] for k in chain], key=lambda b: b.cx)
+                hmed = float(np.median([b.h for b in rb]))
+                full = [k for k, b in enumerate(rb) if 0.8 * hmed <= b.h <= 1.25 * hmed]
+                rows.append(TextRow(rb, "jianpu", hmed, full))
+                used[chain] = True
+        rest = np.flatnonzero(~used)
+    chains = [list(rest[c]) for c in _chain_blobs(B[rest])] if len(rest) >= 3 else []
+    if merge_rows and chains:
+        chains = _merge_chains(chains, B)
     for chain in chains:
         if len(chain) < 3:
             continue
@@ -632,6 +701,9 @@ def scale_structures(S: Structures, s: float) -> Structures:
         for b in r.blobs:
             b.x0, b.y0, b.x1, b.y1 = b.x0 * s, b.y0 * s, b.x1 * s, b.y1 * s
     T.regions = [(t, np.asarray(p, float) * s) for t, p in S.regions]
+    if S.heads is not None:
+        T.heads = S.heads.copy()
+        T.heads[:, :3] *= s
     return T
 
 
@@ -729,8 +801,30 @@ def _fuse_staves(cf, cs, lf, ls, prefer=1.3):
     return frags, staves, kept
 
 
+def spacing_classes(spacings, gap=1.3):
+    """Label staves by printed size: sorted spacings split where one is more
+    than ``gap`` times the next smaller one. A solo part above a piano score
+    (or an ossia / cue staff) is printed at 0.55-0.75 of the main size, while
+    perspective changes one size by at most ~1.2 across a photo. Priors of the
+    form "all staves have the same spacing" (B, C) hold only within a class
+    (hand-held violin + piano photos, 2026-11-19: one global spacing stretched
+    the violin staves to the piano size and bent the whole page)."""
+    sp = np.asarray(spacings, float)
+    labels = np.zeros(len(sp), int)
+    if len(sp) < 2:
+        return labels
+    order = np.argsort(sp)
+    k = 0
+    for prev, cur in zip(order[:-1], order[1:]):
+        if sp[cur] > gap * sp[prev]:
+            k += 1
+        labels[cur] = k
+    return labels
+
+
 def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_lines=False,
-                      merge_rows=False, stem_refine=False, seg=None, valid=None, fuse="page") -> Structures:
+                      merge_rows=False, stem_refine=False, seg=None, valid=None, fuse="page",
+                      jp_rows="chain", glyph="template") -> Structures:
     """Detect exported structures; ``robust=False`` preserves optimizer evidence.
 
     Recovered faint/broken lines are useful for page type and annotations, but
@@ -746,6 +840,9 @@ def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_l
     ``seg``: optional learned masks (``learned.masks``) on this image; staff
     lines then come from the staff mask and strokes inside staff bands from
     the stem mask (see ``_learned_staves``).
+    ``jp_rows``: chain (all glyphs chained, rows classified afterwards) |
+    digit (jianpu note rows chained from digit blobs first, ``find_text_rows``).
+    ``glyph``: digit classifier for ``jp_rows="digit"``: template | cnn.
     ``valid``: optional 0/1 sheet mask; ink and learned masks off the sheet
     are ignored (``ink`` is expected to be masked already).
     """
@@ -808,7 +905,7 @@ def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_l
         sp = float(np.median([s.spacing for s in staves]))
     band = staff_band_mask(ink.shape, staves)
     rows, h_mode = find_text_rows(ink, int(max(25, 3 * (sp or 12))), band,
-                                 reject_boxes=robust, merge_rows=merge_rows)
+                                 reject_boxes=robust, merge_rows=merge_rows, digit_first=jp_rows == "digit", classifier=glyph)
     jp_rows = [r for r in rows if r.kind == "jianpu"]
     cands = []
     if staves:
@@ -848,6 +945,7 @@ def detect_structures(norm: np.ndarray, ink: np.ndarray, *, robust=True, local_l
         if np.abs(A @ coef - p[:, 0]).max() < 2.0:
             vsegs.append(VSeg(p))
     S = Structures((H, W), thick, sp, frags, staves, rows, vsegs)
+    S.heads = find_noteheads(ink, staves, sp)
     _classify_page(S)
     return S
 

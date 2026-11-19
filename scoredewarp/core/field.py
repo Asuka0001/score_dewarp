@@ -18,7 +18,7 @@ from scipy.interpolate import LinearNDInterpolator
 from scipy.sparse import coo_matrix, csr_matrix, vstack
 from scipy.sparse.linalg import spsolve
 
-from .structures import Structures
+from .structures import Structures, spacing_classes
 from .transforms import BackwardMap
 
 
@@ -113,7 +113,7 @@ def _sub(pts, d):
     return pts[keep]
 
 
-def _row_ends(S: Structures, side, reject=1.5):
+def _row_ends(S: Structures, side, reject=1.5, jianpu=False):
     """One end point per staff row, outliers removed: (N, 2) array.
 
     A row's end is where its staff lines end: per line the outermost fragment
@@ -122,7 +122,9 @@ def _row_ends(S: Structures, side, reject=1.5):
     short by a clef does not move it). Not the 5-line tuples: notes and clefs
     interrupt those, so they stop up to several spacings short of the ends.
     Rows more than ``reject`` spacings off a robust line through all ends are
-    dropped: an indented first system, a short last staff of an exercise."""
+    dropped: an indented first system, a short last staff of an exercise.
+    ``jianpu``: also the jianpu note rows (first glyph / final barline or last
+    glyph): a jianpu page has no staves, but its rows share the same margins."""
     from scipy.stats import theilslopes
     from .gcs import _staff_rows
     row = _staff_rows(S.staves)
@@ -144,10 +146,30 @@ def _row_ends(S: Structures, side, reject=1.5):
         q = np.array(by_row[r])
         if len(q) >= 3:
             P.append(q[np.argsort(q[:, 0])[len(q) // 2]])
-    if len(P) < 3:
+    units = [st.spacing for st in S.staves]
+    if jianpu:
+        for r in S.rows:
+            if r.kind != "jianpu" or len(r.full) < 3:
+                continue
+            # only the right side, at the row's final barline: jianpu rows end
+            # justified on a barline, but their first glyphs do not line up
+            # (dev GT: left ends spread 3-6 % of the page width, right ends 0)
+            if side == 0:
+                continue
+            fb = [r.blobs[i] for i in r.full]
+            cy, h = float(np.median([b.cy for b in fb])), r.height
+            x1 = max(b.x1 for b in fb)
+            bars = [float(np.median(v.pts[:, 0])) for v in S.vsegs
+                    if x1 - 0.5 * h <= np.median(v.pts[:, 0]) <= x1 + 3 * h
+                    and v.pts[:, 1].min() <= cy <= v.pts[:, 1].max()]
+            if bars:
+                P.append(np.array([max(bars), cy]))
+                units.append(0.5 * h)
+    if len(P) < 3 or not units:
         return np.zeros((0, 2))
     P = np.array(P)
-    sp = float(np.median([st.spacing for st in S.staves]))
+    P = P[np.argsort(P[:, 1])]
+    sp = float(np.median(units))
     k, c = theilslopes(P[:, 0], P[:, 1])[:2]
     ok = np.abs(P[:, 0] - (c + k * P[:, 1])) < reject * sp
     return P[ok] if ok.sum() >= 3 else np.zeros((0, 2))
@@ -199,13 +221,57 @@ def _vertical_support(pts, staves):
     return 0.5 + 0.1 * crossings
 
 
+def _run_median(a, k=5):
+    a = np.asarray(a, float)
+    r = k // 2
+    return np.array([np.median(a[max(0, i - r):i + r + 1]) for i in range(len(a))])
+
+
+def _head_scale(S: Structures, si, x, ref):
+    """Flat / image length ratio along staff ``si`` at positions ``x`` from the
+    local notehead width (equal flat widths), or None with too few heads."""
+    h = S.heads[S.heads[:, 3] == si]
+    if len(h) < 4:
+        return None
+    h = h[np.argsort(h[:, 0])]
+    w = np.clip(_run_median(h[:, 2]), 0.7 * ref, 1.4 * ref)
+    return ref / np.interp(x, h[:, 0], w)
+
+
+def _digit_widths(rows):
+    """Page median width per jianpu digit class (each class is one glyph)."""
+    by = {}
+    for r in rows:
+        if r.kind != "jianpu":
+            continue
+        for i in r.full:
+            b = r.blobs[i]
+            if b.digit is not None:
+                by.setdefault(b.digit, []).append(b.w)
+    return {d: float(np.median(v)) for d, v in by.items() if len(v) >= 3}
+
+
 def build_constraints(S: Structures, grid, priors=("staff", "jianpu", "text", "vertical"), tuple_u=0.3, vseg_w=0.6,
-                      spacing_gate=0.2, ends_w=0.0, ends_mode="chain", vseg_balance=False):
+                      spacing_gate=0.2, ends_w=0.0, ends_mode="chain", vseg_balance=False, h_ruler="vertical",
+                      row_u=0.3, text_u=None, block_jp=False, edge_w=0.0, size_classes=False):
+    """``h_ruler``: what sets lengths along staff lines / jianpu rows (U).
+    vertical: the local staff spacing / digit height (assumes the page is
+    foreshortened equally in x and y, blind to x-only compression);
+    glyph: the local width of filled noteheads / same-class jianpu digits,
+    falling back to vertical where a staff or row has too few of them."""
+    heads = getattr(S, "heads", None)
+    hw_ref = float(np.median(heads[:, 2])) if (h_ruler == "glyph" and heads is not None and len(heads) >= 8) else None
+    dig_w = _digit_widths(S.rows) if h_ruler == "glyph" else {}
     """``tuple_u`` ties U of the 5 staff lines at one *current* image column, which
     preserves whatever shear the current image has; 0 lets vertical strokes decide.
     ``spacing_gate``: a staff (jianpu row) whose spacing (digit height) deviates
     from the page median by more than this fraction keeps its own value, as a
     genuinely smaller staff would; larger values pull badly fitted staves back.
+    ``size_classes``: the page prints staves in more than one size (decided by
+    the surface fit on the photo, ``GCSModel.staff_groups``): spacing and
+    notehead references per size (``spacing_classes``). Off, every staff is
+    referred to the page median, which also pulls back staves the surface left
+    stretched.
     ``ends_w``: the staves' left ends (clefs) and right ends share one U each
     (justified systems; an indented first system is an outlier for the robust
     solve), as in the margin constraints of Stamatopoulos et al. 2011.
@@ -214,10 +280,19 @@ def build_constraints(S: Structures, grid, priors=("staff", "jianpu", "text", "v
     end per staff row with outliers removed (``_row_ends``)."""
     U, V = _System(grid), _System(grid)
     staves = S.staves if "staff" in priors else []
-    s_all = [st.spacing for st in staves]
-    s_ref = float(np.median(s_all)) if s_all else None
-    for st in staves:
-        s_t = st.spacing if (s_ref is None or abs(st.spacing - s_ref) > spacing_gate * s_ref) else s_ref
+    s_all = np.array([st.spacing for st in staves])
+    # references per printed staff size (spacing_classes): a violin staff above
+    # the piano is not pulled to the piano's spacing / notehead width
+    cls = spacing_classes(s_all) if size_classes else np.zeros(len(s_all), int)
+    s_cls = {c: float(np.median(s_all[cls == c])) for c in set(cls.tolist())}
+    hw_cls = {}
+    if hw_ref is not None:
+        for c in s_cls:
+            h = heads[np.isin(heads[:, 3], np.flatnonzero(cls == c))]
+            hw_cls[c] = float(np.median(h[:, 2])) if len(h) >= 8 else hw_ref * s_cls[c] / float(np.median(s_all))
+    for si, st in enumerate(staves):
+        s_ref = s_cls[cls[si]]
+        s_t = st.spacing if abs(st.spacing - s_ref) > spacing_gate * s_ref else s_ref
         T = np.array(st.tuples)  # (n,5,2)
         if len(T) == 0:
             continue
@@ -233,13 +308,27 @@ def build_constraints(S: Structures, grid, priors=("staff", "jianpu", "text", "v
             if len(p) < 2:
                 continue
             V.diff(p[1:], p[:-1], 0.0, 1.0)
-            sc = s_t / np.interp((p[1:, 0] + p[:-1, 0]) / 2, xs_t[order], loc[order])
+            xm = (p[1:, 0] + p[:-1, 0]) / 2
+            sc = _head_scale(S, si, xm, hw_cls[cls[si]]) if hw_ref else None
+            if sc is None:
+                sc = s_t / np.interp(xm, xs_t[order], loc[order])
             U.diff(p[1:], p[:-1], np.linalg.norm(np.diff(p, axis=0), axis=1) * sc, 0.5)
-    if ends_w > 0 and len(staves) >= 3 and ends_mode == "rows":
+    n_jp = sum(r.kind == "jianpu" and len(r.full) >= 3 for r in S.rows) if block_jp else 0
+    if ends_w > 0 and len(staves) + n_jp >= 3 and ends_mode == "rows":
         for side in (0, -1):
-            pts = _row_ends(S, side)
+            pts = _row_ends(S, side, jianpu=block_jp)
             if len(pts) >= 3:
                 U.diff(pts[1:], pts[:-1], 0.0, ends_w)
+                if edge_w > 0:
+                    # the text block's side is one straight line on the flat
+                    # page, also between the rows: points along the segments
+                    # joining consecutive row ends share one U
+                    q = [pts[0]]
+                    for a, b in zip(pts[:-1], pts[1:]):
+                        n = max(1, int(np.ceil(np.linalg.norm(b - a) / (0.5 * grid.node))))
+                        q += [a + (b - a) * t for t in np.linspace(0, 1, n + 1)[1:]]
+                    q = np.array(q)
+                    U.diff(q[1:], q[:-1], 0.0, edge_w)
     elif ends_w > 0 and len(staves) >= 3:
         for side in (0, -1):
             pts = []
@@ -281,7 +370,16 @@ def build_constraints(S: Structures, grid, priors=("staff", "jianpu", "text", "v
         V.diff(bot, top, h_t, w)
         hloc = np.convolve(np.pad(hs, 2, mode="edge"), np.ones(5) / 5, "valid")
         sc = h_t / ((hloc[1:] + hloc[:-1]) / 2)
-        U.diff(mid[1:], mid[:-1], np.linalg.norm(np.diff(mid, axis=0), axis=1) * sc, 0.3 * w)
+        if dig_w and r.kind == "jianpu":
+            ratio = np.array([b.w / dig_w[b.digit] if b.digit in dig_w else np.nan for b in fb])
+            ok = np.isfinite(ratio)
+            if ok.sum() >= 3:
+                idx = np.arange(len(fb))
+                ratio = np.clip(np.interp(idx, idx[ok], ratio[ok]), 0.7, 1.4)
+                rloc = np.convolve(np.pad(ratio, 2, mode="edge"), np.ones(5) / 5, "valid")
+                sc = 1.0 / ((rloc[1:] + rloc[:-1]) / 2)
+        U.diff(mid[1:], mid[:-1], np.linalg.norm(np.diff(mid, axis=0), axis=1) * sc,
+               (row_u if r.kind == "jianpu" or text_u is None else text_u) * w)
     if "vertical" in priors:
         for v in S.vsegs:
             p = _sub(v.pts, 15)
@@ -337,7 +435,8 @@ def _guard_field(UV, identity, node, min_scale=0.2, max_scale=5.0):
 
 def fit_field(S: Structures, node=48, lam=6.0, mu=0.02, priors=("staff", "jianpu", "text", "vertical"),
               tuple_u=0.3, vseg_w=0.6, lam_u=None, lam_v=None, spacing_gate=0.2, ends_w=0.0, keep_scale=False,
-              anchor=False, keep_pts=None, ends_mode="chain", guard=False, vseg_balance=False):
+              anchor=False, keep_pts=None, ends_mode="chain", guard=False, vseg_balance=False, h_ruler="vertical",
+              row_u=0.3, text_u=None, block_jp=False, edge_w=0.0, size_classes=False):
     """``lam_u`` / ``lam_v`` override the smoothness per component: V is pinned by
     many reliable staff lines, U only by short, noisier vertical strokes.
     ``keep_scale``: constrain U and V to unit mean gradient in the solve (global
@@ -353,7 +452,8 @@ def fit_field(S: Structures, node=48, lam=6.0, mu=0.02, priors=("staff", "jianpu
     H, W = S.shape
     g = _Grid(W, H, node)
     U, V = build_constraints(S, g, priors, tuple_u=tuple_u, vseg_w=vseg_w, spacing_gate=spacing_gate, ends_w=ends_w,
-                             ends_mode=ends_mode, vseg_balance=vseg_balance)
+                             ends_mode=ends_mode, vseg_balance=vseg_balance, h_ruler=h_ruler, row_u=row_u, text_u=text_u,
+                             block_jp=block_jp, edge_w=edge_w, size_classes=size_classes)
     if not U.A or not V.A:
         return None
     if keep_scale:
